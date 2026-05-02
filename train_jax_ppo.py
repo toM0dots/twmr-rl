@@ -18,6 +18,13 @@ import datetime
 import functools
 import json
 import os
+
+xla_flags = os.environ.get("XLA_FLAGS", "")
+xla_flags += " --xla_gpu_triton_gemm_any=True"
+os.environ["XLA_FLAGS"] = xla_flags
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["MUJOCO_GL"] = "egl"
+
 import time
 import warnings
 
@@ -41,17 +48,21 @@ from mujoco_playground.config import (
     manipulation_params,
 )
 
+import csv
+progress_rows = []
+metrics_csv_path = None
+metrics_csv_header_written = False
+
 try:
     import wandb
 except ImportError:
     wandb = None
 
+import sys
+sys.path.append("/users/0/tang1014/tmwr/twmr-rl/sandbox/Tom")
+import graph_ppo_networks
 
-xla_flags = os.environ.get("XLA_FLAGS", "")
-xla_flags += " --xla_gpu_triton_gemm_any=True"
-os.environ["XLA_FLAGS"] = xla_flags
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["MUJOCO_GL"] = "egl"
+
 
 # Ignore the info logs from brax
 logging.set_verbosity(logging.WARNING)
@@ -79,8 +90,10 @@ _PLAYGROUND_CONFIG_OVERRIDES = flags.DEFINE_string(
 )
 _VISION = flags.DEFINE_boolean("vision", False, "Use vision input")
 _LOAD_CHECKPOINT_PATH = flags.DEFINE_string(
-    "load_checkpoint_path", None, "Path to load checkpoint from"
+    "load_checkpoint_path",None, "Path to load checkpoint from"
 )
+
+# gnn '/users/0/tang1014/tmwr/twmr-rl/logs/TransformableWheelMobileRobot-20260407-031936/checkpoints'
 _SUFFIX = flags.DEFINE_string("suffix", None, "Suffix for the experiment name")
 _PLAY_ONLY = flags.DEFINE_boolean(
     "play_only", False, "If true, only play with the model and do not train"
@@ -91,34 +104,34 @@ _USE_WANDB = flags.DEFINE_boolean(
     "Use Weights & Biases for logging (ignored in play-only mode)",
 )
 _USE_TB = flags.DEFINE_boolean(
-    "use_tb", False, "Use TensorBoard for logging (ignored in play-only mode)"
+    "use_tb", True, "Use TensorBoard for logging (ignored in play-only mode)"
 )
 _DOMAIN_RANDOMIZATION = flags.DEFINE_boolean(
     "domain_randomization", False, "Use domain randomization"
 )
-_SEED = flags.DEFINE_integer("seed", 1, "Random seed")
+_SEED = flags.DEFINE_integer("seed", 17, "Random seed")
 _NUM_TIMESTEPS = flags.DEFINE_integer("num_timesteps", 1_000_000, "Number of timesteps")
 _NUM_VIDEOS = flags.DEFINE_integer(
     "num_videos", 1, "Number of videos to record after training."
 )
-_NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
+_NUM_EVALS = flags.DEFINE_integer("num_evals", 100, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")
 _EPISODE_LENGTH = flags.DEFINE_integer("episode_length", 1000, "Episode length")
 _NORMALIZE_OBSERVATIONS = flags.DEFINE_boolean(
     "normalize_observations", True, "Normalize observations"
 )
 _ACTION_REPEAT = flags.DEFINE_integer("action_repeat", 1, "Action repeat")
-_UNROLL_LENGTH = flags.DEFINE_integer("unroll_length", 10, "Unroll length")
-_NUM_MINIBATCHES = flags.DEFINE_integer("num_minibatches", 8, "Number of minibatches")
+_UNROLL_LENGTH = flags.DEFINE_integer("unroll_length", 100, "Unroll length")
+_NUM_MINIBATCHES = flags.DEFINE_integer("num_minibatches", 16, "Number of minibatches")
 _NUM_UPDATES_PER_BATCH = flags.DEFINE_integer(
     "num_updates_per_batch", 8, "Number of updates per batch"
 )
-_DISCOUNTING = flags.DEFINE_float("discounting", 0.97, "Discounting")
+_DISCOUNTING = flags.DEFINE_float("discounting", 0.99, "Discounting")
 _LEARNING_RATE = flags.DEFINE_float("learning_rate", 5e-4, "Learning rate")
-_ENTROPY_COST = flags.DEFINE_float("entropy_cost", 5e-3, "Entropy cost")
-_NUM_ENVS = flags.DEFINE_integer("num_envs", 1024, "Number of environments")
-_NUM_EVAL_ENVS = flags.DEFINE_integer("num_eval_envs", 128, "Number of evaluation environments")
-_BATCH_SIZE = flags.DEFINE_integer("batch_size", 256, "Batch size")
+_ENTROPY_COST = flags.DEFINE_float("entropy_cost", 3e-3, "Entropy cost")
+_NUM_ENVS = flags.DEFINE_integer("num_envs", 16, "Number of environments")
+_NUM_EVAL_ENVS = flags.DEFINE_integer("num_eval_envs", 16, "Number of evaluation environments")
+_BATCH_SIZE = flags.DEFINE_integer("batch_size", 16, "Batch size")
 _MAX_GRAD_NORM = flags.DEFINE_float("max_grad_norm", 1.0, "Max grad norm")
 _CLIPPING_EPSILON = flags.DEFINE_float("clipping_epsilon", 0.2, "Clipping epsilon for PPO")
 _POLICY_HIDDEN_LAYER_SIZES = flags.DEFINE_list(
@@ -156,7 +169,7 @@ _LOG_TRAINING_METRICS = flags.DEFINE_boolean(
 )
 _TRAINING_METRICS_STEPS = flags.DEFINE_integer(
     "training_metrics_steps",
-    1_000_000,
+    1_000,
     "Number of steps between logging training metrics. Increase if training"
     " experiences slowdown.",
 )
@@ -285,6 +298,7 @@ def main(argv):
     logdir = epath.Path("logs").resolve() / exp_name
     logdir.mkdir(parents=True, exist_ok=True)
     print(f"Logs are being stored in: {logdir}")
+    metrics_csv_path = os.path.join(logdir, "training_metrics.csv")
 
     # Initialize Weights & Biases if required
     if _USE_WANDB.value and not _PLAY_ONLY.value:
@@ -334,7 +348,7 @@ def main(argv):
     network_fn = (
         ppo_networks_vision.make_ppo_networks_vision
         if _VISION.value
-        else ppo_networks.make_ppo_networks
+        else graph_ppo_networks.make_ppo_networks
     )
     if hasattr(ppo_params, "network_factory"):
         network_factory = functools.partial(network_fn, **ppo_params.network_factory)
@@ -357,9 +371,28 @@ def main(argv):
     num_eval_envs = (
         ppo_params.num_envs if _VISION.value else ppo_params.get("num_eval_envs", 128)
     )
+    print("ENV NAME:", _ENV_NAME.value)
+    print("observation_size:", env.observation_size)
+    print("action_size:", env.action_size)
+    mj = env.mj_model
+    print(f"nq: {mj.nq}, nv: {mj.nv}, nu: {mj.nu}")
 
+    print("\n--- Joints ---")
+    for i in range(mj.njnt):
+        print(f"  joint {i}: {mj.joint(i).name!r}  qposadr={mj.jnt_qposadr[i]}  dofadr={mj.jnt_dofadr[i]}")
+
+    print("\n--- Actuators ---")
+    for i in range(mj.nu):
+        print(f"  actuator {i}: {mj.actuator(i).name!r}")
+
+    print("\n--- Bodies ---")
+    for i in range(mj.nbody):
+        print(f"  body {i}: {mj.body(i).name!r}")
+    
     if "num_eval_envs" in training_params:
         del training_params["num_eval_envs"]
+        
+    
 
     train_fn = functools.partial(
         ppo.train,
@@ -374,9 +407,30 @@ def main(argv):
 
     times = [time.monotonic()]
 
-    # Progress function for logging
+
     def progress(num_steps, metrics):
+        global metrics_csv_header_written
+
         times.append(time.monotonic())
+
+        row = {"num_steps": int(num_steps)}
+        for key, value in metrics.items():
+            try:
+                row[key] = float(value)
+            except Exception:
+                pass
+
+        progress_rows.append(row)
+
+        # append to CSV every callback
+        if metrics_csv_path is not None:
+            fieldnames = ["num_steps"] + sorted(k for k in row.keys() if k != "num_steps")
+            with open(metrics_csv_path, "a", newline="") as f:
+                writer_csv = csv.DictWriter(f, fieldnames=fieldnames)
+                if not metrics_csv_header_written:
+                    writer_csv.writeheader()
+                    metrics_csv_header_written = True
+                writer_csv.writerow(row)
 
         # Log to Weights & Biases
         if _USE_WANDB.value and not _PLAY_ONLY.value:
@@ -387,12 +441,13 @@ def main(argv):
             for key, value in metrics.items():
                 writer.add_scalar(key, value, num_steps)
             writer.flush()
-        if _RUN_EVALS.value:
-            print(f"{num_steps}: reward={metrics['eval/episode_reward']:.3f}")
-        if _LOG_TRAINING_METRICS.value:
-            if "episode/sum_reward" in metrics:
-                print(f"{num_steps}: mean episode reward={metrics['episode/sum_reward']:.3f}")
 
+        if _RUN_EVALS.value and "eval/episode_reward" in row:
+            print(f"{num_steps}: reward={row['eval/episode_reward']:.3f}")
+
+        if _LOG_TRAINING_METRICS.value and "episode/sum_reward" in row:
+            print(f"{num_steps}: mean episode reward={row['episode/sum_reward']:.3f}")
+            
     # Load evaluation environment.
     eval_env = None
     if not _VISION.value:
@@ -435,13 +490,32 @@ def main(argv):
             rscope_handle.set_make_policy(make_policy)
             rscope_handle.dump_rollout(params)
 
+    
+    def random_rollout(env, steps=200):
+        key = jax.random.PRNGKey(0)
+        key, k = jax.random.split(key)
+        state = env.reset(k)
+    
+        def step_fn(carry, _):
+            state, key = carry
+            key, ak = jax.random.split(key)
+            # actions in [-1, 1]
+            a = jax.random.uniform(ak, (env.action_size,), minval=-1.0, maxval=1.0)
+            nstate = env.step(state, a)
+            return (nstate, key), nstate.reward
+    
+        (final_state, _), rewards = jax.lax.scan(step_fn, (state, key), None, length=steps)
+        return rewards
+
     # Train or load the model
+    
     make_inference_fn, params, _ = train_fn(  # pylint: disable=no-value-for-parameter
         environment=env,
         progress_fn=progress,
         policy_params_fn=policy_params_fn,
         eval_env=eval_env,
     )
+    
 
     print("Done training.")
     if len(times) > 1:
@@ -507,9 +581,18 @@ def main(argv):
     scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
     scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
     scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
+    
+    cam = mujoco.MjvCamera()
+    cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    cam.trackbodyid = eval_env.mj_model.body("root").id   # or whichever body you want
+    cam.distance = 0.4    # smaller = closer
+    cam.azimuth = 90
+    cam.elevation = -20
+    cam.lookat[:] = [0.0, 0.0, 0.1]   # often ignored for tracking, but harmless
+    
     for i, rollout in enumerate(trajectories):
         traj = rollout[::render_every]
-        frames = eval_env.render(traj, height=480, width=640, scene_option=scene_option)
+        frames = eval_env.render(traj, height=480, width=640, scene_option=scene_option, camera=cam,)
         media.write_video(f"rollout{i}.mp4", frames, fps=fps)
         print(f"Rollout video saved as 'rollout{i}.mp4'.")
 

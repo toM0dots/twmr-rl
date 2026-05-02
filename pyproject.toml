@@ -9,6 +9,9 @@ dependencies = [
     "twmr",
     "wmr",
     "ipykernel>=7.1.0",
+    "playground>=0.1.0",
+    "mujoco>=3.6.0",
+    "mujoco-mjx>=3.6.0",
 ]
 
 [tool.uv.workspace]

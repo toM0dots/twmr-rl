@@ -36,8 +36,8 @@
     <light directional="true" diffuse="0.4 0.4 0.4" specular="0.1 0.1 0.1" pos="0 0 5.0" dir="0 0 -1" castshadow="false" />
     <light directional="true" diffuse="0.6 0.6 0.6" specular="0.2 0.2 0.2" pos="0 0 4" dir="0 0 -1" />
     <geom name="ground" type="plane" pos="0 0 0" size="10 10 0.001" quat="1 0 0 0" material="matplane" condim="3" conaffinity="15" />
-    <geom name="traverse_box" type="box" pos="0.6 0 0.01" size="0.2 5 0.05" rgba="0.8 0.2 0.2 1" />
-    <site name="traverse_box_site" pos="0.6 0 0.01" size="0.01" rgba="1 1 0 1"/>
+    <geom name="traverse_box" type="box" pos="1.2 0 0.01" size="0.2 5 0.04" rgba="0.8 0.2 0.2 1" />
+    <site name="traverse_box_site" pos="1.2 0 0.01" size="0.01" rgba="1 1 0 1"/>
     
     <body name="root" pos="0 0 0.60117751451163032" quat="1 0 0 0">
       <freejoint name="root" />
