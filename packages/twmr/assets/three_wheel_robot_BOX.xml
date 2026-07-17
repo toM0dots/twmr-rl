@@ -1,0 +1,565 @@
+<mujoco model="three_wheel_nested_mjx_flat">
+
+  <!--
+    MJX/Warp-friendly three-wheel transformable robot.
+
+
+    Important MJX choices:
+      - cylinders are visual-only: contype="0" conaffinity="0"
+      - wheel collision is modeled by spheres
+      - no obstacle for this stage
+      - no equality constraint for lower folding
+      - lower folding is implemented by two mirrored position servos
+
+    Coordinate convention:
+      x = forward
+      y = lateral / axle direction
+      z = up
+
+    Geometry:
+      wheel radius       = 0.025 m
+      leg length         = 0.150 m
+      robot mass         ≈ 0.5 kg
+
+    Initial pose:
+      front lower leg: +x, negative y side
+      rear lower leg:  -x, positive y side
+      upper arm:       +x, centered between them
+
+    Actuator order:
+      0 front_lower_wheel_drive
+      1 rear_lower_wheel_drive
+      2 upper_wheel_drive
+      3 upper_swing_servo
+      4 front_lower_fold_servo
+      5 rear_lower_fold_servo
+
+    Logical PPO action should be 5D:
+      action[0] lower common drive
+      action[1] lower drive difference
+      action[2] upper wheel drive
+      action[3] delta upper target
+      action[4] delta fold target
+
+    Then map to 6D ctrl:
+      ctrl[0] = front wheel speed
+      ctrl[1] = rear wheel speed
+      ctrl[2] = upper wheel speed
+      ctrl[3] = upper arm target
+      ctrl[4] = +fold target
+      ctrl[5] = -fold target
+  -->
+
+  <compiler angle="radian"
+            coordinate="local"
+            inertiafromgeom="true"
+            autolimits="true"/>
+
+  <option timestep="0.01"
+          gravity="0 0 -9.81"
+          solver="Newton"
+          iterations="80"
+          integrator="RK4"/>
+
+  <default>
+    <joint damping="0.02"
+           armature="0.0005"
+           frictionloss="0.001"/>
+
+    <geom contype="1"
+          conaffinity="1"
+          condim="3"
+          friction="1.3 0.01 0.001"
+          solref="0.01 1"
+          solimp="0.9 0.95 0.001"/>
+
+    <velocity ctrllimited="true"
+              forcelimited="true"/>
+
+    <position ctrllimited="true"
+              forcelimited="true"/>
+  </default>
+
+  <asset>
+    <texture name="grid"
+             type="2d"
+             builtin="checker"
+             width="512"
+             height="512"
+             rgb1="0.85 0.85 0.85"
+             rgb2="0.72 0.72 0.72"/>
+
+    <material name="ground_mat"
+              texture="grid"
+              texrepeat="6 6"
+              reflectance="0.1"/>
+
+    <material name="leg_mat"
+              rgba="0.20 0.19 0.16 1"/>
+
+    <material name="wheel_mat"
+              rgba="0.82 0.80 0.72 1"/>
+
+    <material name="hub_mat"
+              rgba="0.08 0.08 0.08 1"/>
+
+    <material name="collision_wheel_mat"
+              rgba="0.82 0.80 0.72 0.35"/>
+    <material name="obstacle_mat"
+              rgba="0.45 0.45 0.45 1"/>
+  </asset>
+
+  <worldbody>
+
+    <light name="top_light"
+           pos="0 0 3"
+           dir="0 0 -1"
+           diffuse="0.8 0.8 0.8"/>
+
+    <camera name="cad_like_camera"
+            pos="-0.65 -1.0 0.42"
+            xyaxes="0.84 -0.54 0 0.22 0.34 0.91"/>
+
+    <geom name="floor"
+          type="plane"
+          pos="0 0 0"
+          size="5 2 0.1"
+          material="ground_mat"
+          friction="1.4 0.01 0.001"/>
+      <!-- Low rectangular obstacle for later climbing / traversal. -->
+    <geom name="step_obstacle"
+          type="box"
+          pos="0.85 0 0.0275"
+          size="0.045 0.40 0.0275"
+          material="obstacle_mat"
+          friction="1.4 0.01 0.001"/>
+
+    <!--
+      Central root.
+      qpos0 z = 0.025 m so all three wheel collision spheres initially touch ground.
+    -->
+    <body name="central_hub" pos="0 0 0.025">
+
+      <freejoint name="root"/>
+
+      <site name="imu"
+            pos="0 0 0.020"
+            size="0.006"
+            rgba="0 1 0 1"/>
+
+      <!-- Invisible electronics/battery mass. Collisionless box, MJX-safe. -->
+      <geom name="electronics_mass"
+            type="box"
+            pos="0 0 0.012"
+            size="0.035 0.022 0.012"
+            mass="0.080"
+            contype="0"
+            conaffinity="0"
+            rgba="0 0 0 0"/>
+
+      <!-- Visual middle hub. Collisionless cylinder to avoid cylinder-box collision. -->
+      <geom name="middle_hub_visual"
+            type="cylinder"
+            pos="0 0 0"
+            euler="1.57079632679 0 0"
+            size="0.024 0.065"
+            mass="0.055"
+            material="hub_mat"
+            contype="0"
+            conaffinity="0"/>
+
+      <!-- Small physical central collision mass, using box instead of cylinder. -->
+      <geom name="middle_hub_collision"
+            type="box"
+            pos="0 0 0"
+            size="0.026 0.030 0.026"
+            mass="0.001"
+            material="hub_mat"
+            friction="1.2 0.01 0.001"/>
+
+      <!-- ========================================================= -->
+      <!-- FRONT LOWER LEG                                           -->
+      <!-- q = 0: points forward along +x                            -->
+      <!-- q > 0: folds downward                                     -->
+      <!-- ========================================================= -->
+
+      <body name="front_lower_leg" pos="0 0 0">
+
+        <joint name="front_lower_fold_hinge"
+               type="hinge"
+               axis="0 1 0"
+               range="0.0 1.75"
+               damping="0.08"
+               armature="0.002"
+               frictionloss="0.002"
+               limited="true"/>
+
+        <geom name="front_lower_side_arm"
+              type="box"
+              pos="0.075 -0.040 0"
+              size="0.075 0.006 0.0175"
+              mass="0.045"
+              material="leg_mat"/>
+
+        <geom name="front_lower_motor_pod"
+              type="box"
+              pos="0.125 -0.040 0"
+              size="0.022 0.012 0.014"
+              mass="0.015"
+              material="hub_mat"/>
+
+        <body name="front_lower_wheel" pos="0.150 -0.062 0">
+
+          <joint name="front_lower_wheel_hinge"
+                 type="hinge"
+                 axis="0 1 0"
+                 damping="0.01"
+                 armature="0.0005"
+                 frictionloss="0.0005"/>
+
+          <!-- Visual wheel cylinder. Collisionless. -->
+          <geom name="front_lower_wheel_visual"
+                type="cylinder"
+                euler="1.57079632679 0 0"
+                size="0.025 0.020"
+                mass="0.0001"
+                material="wheel_mat"
+                contype="0"
+                conaffinity="0"/>
+
+          <!-- Physical wheel collision. MJX-friendly sphere. -->
+          <geom name="front_lower_wheel_collision"
+                type="sphere"
+                size="0.025"
+                mass="0.050"
+                material="collision_wheel_mat"
+                friction="1.6 0.01 0.001"/>
+
+          <!-- Visual hub cap. Collisionless cylinder. -->
+          <geom name="front_lower_wheel_cap"
+                type="cylinder"
+                euler="1.57079632679 0 0"
+                pos="0 -0.022 0"
+                size="0.015 0.004"
+                mass="0.0001"
+                material="hub_mat"
+                contype="0"
+                conaffinity="0"/>
+
+        </body>
+
+      </body>
+
+      <!-- ========================================================= -->
+      <!-- REAR LOWER LEG                                            -->
+      <!-- q = 0: points backward along -x                           -->
+      <!-- q < 0: folds downward                                     -->
+      <!-- ========================================================= -->
+
+      <body name="rear_lower_leg" pos="0 0 0">
+
+        <joint name="rear_lower_fold_hinge"
+               type="hinge"
+               axis="0 1 0"
+               range="-1.75 0.0"
+               damping="0.08"
+               armature="0.002"
+               frictionloss="0.002"
+               limited="true"/>
+
+        <geom name="rear_lower_side_arm"
+              type="box"
+              pos="-0.075 0.040 0"
+              size="0.075 0.006 0.0175"
+              mass="0.045"
+              material="leg_mat"/>
+
+        <geom name="rear_lower_motor_pod"
+              type="box"
+              pos="-0.125 0.040 0"
+              size="0.022 0.012 0.014"
+              mass="0.015"
+              material="hub_mat"/>
+
+        <body name="rear_lower_wheel" pos="-0.150 0.062 0">
+
+          <joint name="rear_lower_wheel_hinge"
+                 type="hinge"
+                 axis="0 1 0"
+                 damping="0.01"
+                 armature="0.0005"
+                 frictionloss="0.0005"/>
+
+          <!-- Visual wheel cylinder. Collisionless. -->
+          <geom name="rear_lower_wheel_visual"
+                type="cylinder"
+                euler="1.57079632679 0 0"
+                size="0.025 0.020"
+                mass="0.0001"
+                material="wheel_mat"
+                contype="0"
+                conaffinity="0"/>
+
+          <!-- Physical wheel collision. MJX-friendly sphere. -->
+          <geom name="rear_lower_wheel_collision"
+                type="sphere"
+                size="0.025"
+                mass="0.050"
+                material="collision_wheel_mat"
+                friction="1.6 0.01 0.001"/>
+
+          <!-- Visual hub cap. Collisionless cylinder. -->
+          <geom name="rear_lower_wheel_cap"
+                type="cylinder"
+                euler="1.57079632679 0 0"
+                pos="0 0.022 0"
+                size="0.015 0.004"
+                mass="0.0001"
+                material="hub_mat"
+                contype="0"
+                conaffinity="0"/>
+
+        </body>
+
+      </body>
+
+      <!-- ========================================================= -->
+      <!-- CENTERED UPPER ARM                                        -->
+      <!-- q = 0: stowed horizontally along +x                       -->
+      <!-- q > 0: swings downward                                    -->
+      <!-- q < 0: swings upward                                      -->
+      <!-- ========================================================= -->
+
+      <body name="upper_swing_arm" pos="0 0 0">
+
+        <joint name="upper_swing_hinge"
+               type="hinge"
+               axis="0 1 0"
+               range="-1.75 1.75"
+               damping="0.08"
+               armature="0.003"
+               frictionloss="0.002"
+               limited="true"/>
+
+        <!-- Visual swing hub. Collisionless cylinder. -->
+        <geom name="upper_swing_hub_visual"
+              type="cylinder"
+              pos="0 0 0"
+              euler="1.57079632679 0 0"
+              size="0.019 0.045"
+              mass="0.030"
+              material="hub_mat"
+              contype="0"
+              conaffinity="0"/>
+
+        <!-- Small physical hub collision as box. -->
+        <geom name="upper_swing_hub_collision"
+              type="box"
+              pos="0 0 0"
+              size="0.020 0.020 0.020"
+              mass="0.001"
+              material="hub_mat"
+              friction="1.2 0.01 0.001"/>
+
+        <geom name="upper_inner_arm"
+              type="box"
+              pos="0.075 0 0"
+              size="0.075 0.010 0.0175"
+              mass="0.060"
+              material="leg_mat"/>
+
+        <geom name="upper_motor_pod"
+              type="box"
+              pos="0.125 0 0"
+              size="0.022 0.016 0.014"
+              mass="0.015"
+              material="hub_mat"/>
+
+        <body name="upper_wheel" pos="0.150 0 0">
+
+          <joint name="upper_wheel_hinge"
+                 type="hinge"
+                 axis="0 1 0"
+                 damping="0.01"
+                 armature="0.0005"
+                 frictionloss="0.0005"/>
+
+          <!-- Visual wheel cylinder. Collisionless. -->
+          <geom name="upper_wheel_visual"
+                type="cylinder"
+                euler="1.57079632679 0 0"
+                size="0.025 0.020"
+                mass="0.0001"
+                material="wheel_mat"
+                contype="0"
+                conaffinity="0"/>
+
+          <!-- Physical wheel collision. MJX-friendly sphere. -->
+          <geom name="upper_wheel_collision"
+                type="sphere"
+                size="0.025"
+                mass="0.050"
+                material="collision_wheel_mat"
+                friction="1.6 0.01 0.001"/>
+
+          <!-- Visual hub cap. Collisionless cylinder. -->
+          <geom name="upper_wheel_cap"
+                type="cylinder"
+                euler="1.57079632679 0 0"
+                pos="0 0.022 0"
+                size="0.015 0.004"
+                mass="0.0001"
+                material="hub_mat"
+                contype="0"
+                conaffinity="0"/>
+
+        </body>
+
+      </body>
+
+    </body>
+
+  </worldbody>
+
+  <!--
+    Internal collision exclusions.
+    Wheels still collide with floor.
+    Internal mechanical parts are excluded for stable flat-ground training.
+  -->
+  <contact>
+    <exclude body1="central_hub" body2="front_lower_leg"/>
+    <exclude body1="central_hub" body2="rear_lower_leg"/>
+    <exclude body1="central_hub" body2="upper_swing_arm"/>
+
+    <exclude body1="front_lower_leg" body2="front_lower_wheel"/>
+    <exclude body1="rear_lower_leg" body2="rear_lower_wheel"/>
+    <exclude body1="upper_swing_arm" body2="upper_wheel"/>
+
+    <exclude body1="central_hub" body2="front_lower_wheel"/>
+    <exclude body1="central_hub" body2="rear_lower_wheel"/>
+    <exclude body1="central_hub" body2="upper_wheel"/>
+
+    <exclude body1="front_lower_leg" body2="rear_lower_leg"/>
+    <exclude body1="front_lower_leg" body2="upper_swing_arm"/>
+    <exclude body1="rear_lower_leg" body2="upper_swing_arm"/>
+  </contact>
+
+  <actuator>
+
+    <!--
+      Wheel velocity motors.
+      800 g cm ≈ 0.078 N m.
+      ctrl is target angular velocity in rad/s.
+    -->
+
+    <velocity name="front_lower_wheel_drive"
+              joint="front_lower_wheel_hinge"
+              kv="0.08"
+              ctrlrange="-45 45"
+              forcerange="-0.078 0.078"/>
+
+    <velocity name="rear_lower_wheel_drive"
+              joint="rear_lower_wheel_hinge"
+              kv="0.08"
+              ctrlrange="-45 45"
+              forcerange="-0.078 0.078"/>
+
+    <velocity name="upper_wheel_drive"
+              joint="upper_wheel_hinge"
+              kv="0.08"
+              ctrlrange="-45 45"
+              forcerange="-0.078 0.078"/>
+
+    <!--
+      Upper swing motor.
+      q = 0 means upper arm stowed horizontally.
+      q > 0 swings downward.
+      q < 0 swings upward.
+    -->
+    <position name="upper_swing_servo"
+              joint="upper_swing_hinge"
+              kp="10"
+              ctrlrange="-1.65 1.65"
+              forcerange="-0.98 0.98"/>
+
+    <!--
+      Lower fold uses two mirrored servos.
+      Your policy should output one fold variable, then duplicate it:
+        front target = +fold
+        rear target  = -fold
+    -->
+
+    <position name="front_lower_fold_servo"
+              joint="front_lower_fold_hinge"
+              kp="20"
+              ctrlrange="0.0 1.65"
+              forcerange="-0.98 0.98"/>
+
+    <position name="rear_lower_fold_servo"
+              joint="rear_lower_fold_hinge"
+              kp="20"
+              ctrlrange="-1.65 0.0"
+              forcerange="-0.98 0.98"/>
+
+  </actuator>
+
+  <sensor>
+      <framequat name="base_orientation"
+           objtype="body"
+           objname="central_hub"/>
+
+    <gyro name="base_angular_velocity"
+          site="imu"/>
+
+    <accelerometer name="base_acceleration"
+                   site="imu"/>
+
+    <actuatorfrc name="front_lower_wheel_motor_torque"
+                 actuator="front_lower_wheel_drive"/>
+
+    <actuatorfrc name="rear_lower_wheel_motor_torque"
+                 actuator="rear_lower_wheel_drive"/>
+
+    <actuatorfrc name="upper_wheel_motor_torque"
+                 actuator="upper_wheel_drive"/>
+
+    <actuatorfrc name="upper_swing_servo_torque"
+                 actuator="upper_swing_servo"/>
+
+    <actuatorfrc name="front_lower_fold_servo_torque"
+                 actuator="front_lower_fold_servo"/>
+
+    <actuatorfrc name="rear_lower_fold_servo_torque"
+                 actuator="rear_lower_fold_servo"/>
+
+
+    <jointpos name="upper_swing_angle"
+              joint="upper_swing_hinge"/>
+
+    <jointvel name="upper_swing_velocity"
+              joint="upper_swing_hinge"/>
+
+    <jointpos name="front_lower_fold_angle"
+              joint="front_lower_fold_hinge"/>
+
+    <jointpos name="rear_lower_fold_angle"
+              joint="rear_lower_fold_hinge"/>
+
+    <jointvel name="front_lower_fold_velocity"
+              joint="front_lower_fold_hinge"/>
+
+    <jointvel name="rear_lower_fold_velocity"
+              joint="rear_lower_fold_hinge"/>
+
+    <jointvel name="front_lower_wheel_velocity"
+              joint="front_lower_wheel_hinge"/>
+
+    <jointvel name="rear_lower_wheel_velocity"
+              joint="rear_lower_wheel_hinge"/>
+
+    <jointvel name="upper_wheel_velocity"
+              joint="upper_wheel_hinge"/>
+
+  </sensor>
+
+</mujoco>

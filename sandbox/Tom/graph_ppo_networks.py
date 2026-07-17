@@ -12,130 +12,314 @@ from brax.training import types
 # --------------------------
 # Robot graph constants
 # --------------------------
-BODY, FL, FR, RL, RR = 0, 1, 2, 3, 4
-NUM_NODES = 5
-NUM_MODULES = 4
+# --------------------------
+# Robot graph constants: new 3-wheel nested-arm robot
+# --------------------------
+
+HUB = 0
+FRONT_LEG = 1
+REAR_LEG = 2
+UPPER_ARM = 3
+FRONT_WHEEL = 4
+REAR_WHEEL = 5
+UPPER_WHEEL = 6
+
+NUM_NODES = 7
+
+ACTOR_OBS_SIZE = 22
+
+QUAT_START = 0
+GYRO_START = 4
+ACCEL_START = 7
+CURRENT_START = 10
+TARGET_START = 15
+LAST_ACTION_START = 17
 
 EDGE_PAIRS = [
-    # body-star
-    (BODY, FL), (FL, BODY),
-    (BODY, FR), (FR, BODY),
-    (BODY, RL), (RL, BODY),
-    (BODY, RR), (RR, BODY),
-    # module ring
-    (FL, FR), (FR, FL),
-    (FR, RR), (RR, FR),
-    (RR, RL), (RL, RR),
-    (RL, FL), (FL, RL),
+    # hub-limb tree
+    (HUB, FRONT_LEG), (FRONT_LEG, HUB),
+    (HUB, REAR_LEG), (REAR_LEG, HUB),
+    (HUB, UPPER_ARM), (UPPER_ARM, HUB),
+
+    # limb-wheel edges
+    (FRONT_LEG, FRONT_WHEEL), (FRONT_WHEEL, FRONT_LEG),
+    (REAR_LEG, REAR_WHEEL), (REAR_WHEEL, REAR_LEG),
+    (UPPER_ARM, UPPER_WHEEL), (UPPER_WHEEL, UPPER_ARM),
+
+    # symmetry / coordination edges
+    (FRONT_LEG, REAR_LEG), (REAR_LEG, FRONT_LEG),
+    (FRONT_WHEEL, REAR_WHEEL), (REAR_WHEEL, FRONT_WHEEL),
+    (UPPER_WHEEL, FRONT_WHEEL), (FRONT_WHEEL, UPPER_WHEEL),
+    (UPPER_WHEEL, REAR_WHEEL), (REAR_WHEEL, UPPER_WHEEL),
+
     # self-loops
-    (BODY, BODY),
-    (FL, FL),
-    (FR, FR),
-    (RL, RL),
-    (RR, RR),
-    # diagonal 
-    (FL, RR), (RR, FL),
-    (FR, RL), (RL, FR),
+    (HUB, HUB),
+    (FRONT_LEG, FRONT_LEG),
+    (REAR_LEG, REAR_LEG),
+    (UPPER_ARM, UPPER_ARM),
+    (FRONT_WHEEL, FRONT_WHEEL),
+    (REAR_WHEEL, REAR_WHEEL),
+    (UPPER_WHEEL, UPPER_WHEEL),
 ]
+
 SENDERS = jp.array([i for i, j in EDGE_PAIRS], dtype=jp.int32)
 RECEIVERS = jp.array([j for i, j in EDGE_PAIRS], dtype=jp.int32)
 NUM_EDGES = SENDERS.shape[0]
 
-NODE_XY = jp.array([
-    [0.0, 0.0],   # BODY
-    [1.0, -1.0],   # FL
-    [1.0, +1.0],  # FR
-    [-1.0, -1.0],  # RL
-    [-1.0, +1.0], # RR
+# Rough abstract graph coordinates, not physical meters.
+NODE_XZ = jp.array([
+    [0.0, 0.0],    # HUB
+    [1.0, 0.0],    # FRONT_LEG
+    [-1.0, 0.0],   # REAR_LEG
+    [0.5, 0.5],    # UPPER_ARM
+    [1.5, 0.0],    # FRONT_WHEEL
+    [-1.5, 0.0],   # REAR_WHEEL
+    [1.5, 0.5],    # UPPER_WHEEL
 ], dtype=jp.float32)
 
-
-BILATERAL_PAIRS = {frozenset([FL, FR]), frozenset([RL, RR])}
-LONGITUDINAL_PAIRS = {frozenset([FL, RL]), frozenset([FR, RR])}
-DIAGONAL_PAIRS = {frozenset([FL, RR]), frozenset([FR, RL])}
 
 def _build_edge_attr():
     attrs = []
     for i, j in EDGE_PAIRS:
-        dxdy = NODE_XY[j] - NODE_XY[i]
-        is_body_module = 1.0 if ((i == BODY) ^ (j == BODY)) else 0.0
-        is_module_module = 1.0 if (i != BODY and j != BODY and i != j) else 0.0
+        dxz = NODE_XZ[j] - NODE_XZ[i]
+
+        is_hub_limb = 1.0 if (
+            (i == HUB and j in [FRONT_LEG, REAR_LEG, UPPER_ARM])
+            or (j == HUB and i in [FRONT_LEG, REAR_LEG, UPPER_ARM])
+        ) else 0.0
+
+        is_limb_wheel = 1.0 if (
+            (i == FRONT_LEG and j == FRONT_WHEEL)
+            or (i == FRONT_WHEEL and j == FRONT_LEG)
+            or (i == REAR_LEG and j == REAR_WHEEL)
+            or (i == REAR_WHEEL and j == REAR_LEG)
+            or (i == UPPER_ARM and j == UPPER_WHEEL)
+            or (i == UPPER_WHEEL and j == UPPER_ARM)
+        ) else 0.0
+
+        is_lower_sym = 1.0 if (
+            {i, j} == {FRONT_LEG, REAR_LEG}
+            or {i, j} == {FRONT_WHEEL, REAR_WHEEL}
+        ) else 0.0
+
+        is_upper_lower = 1.0 if (
+            {i, j} == {UPPER_WHEEL, FRONT_WHEEL}
+            or {i, j} == {UPPER_WHEEL, REAR_WHEEL}
+        ) else 0.0
+
         is_self = 1.0 if i == j else 0.0
-        
-        # New symmetry flags
-        pair = frozenset([i, j])
-        is_bilateral = 1.0 if pair in BILATERAL_PAIRS else 0.0
-        is_longitudinal = 1.0 if pair in LONGITUDINAL_PAIRS else 0.0
-        
-        attrs.append(jp.array(
-            [dxdy[0], dxdy[1], is_body_module, is_module_module, 
-             is_self, is_bilateral, is_longitudinal],
-            dtype=jp.float32,
-        ))
+
+        attrs.append(jp.array([
+            dxz[0],
+            dxz[1],
+            is_hub_limb,
+            is_limb_wheel,
+            is_lower_sym,
+            is_upper_lower,
+            is_self,
+        ], dtype=jp.float32))
+
     return jp.stack(attrs, axis=0)
 
 
-EDGE_ATTR = _build_edge_attr()  # [E, Fe]
-RECV_ONEHOT = jax.nn.one_hot(RECEIVERS, NUM_NODES, dtype=jp.float32)  # [E, N]
-RECV_DEG = jp.sum(RECV_ONEHOT, axis=0)  # [N]
-
+EDGE_ATTR = _build_edge_attr()
+RECV_ONEHOT = jax.nn.one_hot(RECEIVERS, NUM_NODES, dtype=jp.float32)
+RECV_DEG = jp.maximum(jp.sum(RECV_ONEHOT, axis=0), 1.0)
 
 # --------------------------
 # obs -> (body,node) features
 # --------------------------
+# Observation layout for current XML/env.
+NQ = 13
+NV = 12
+TARGET_START = NQ + NV
+LAST_ACTION_START = TARGET_START + 2
+
+LEG_LENGTH = 0.150
+WHEEL_SPEED_SCALE = 45.0
+JOINT_VEL_SCALE = 10.0
+ANGLE_SCALE = 1.65
+ROOT_VEL_SCALE = 2.0
+
+
 def parse_obs_to_nodes(obs_batch: jp.ndarray):
-    qpos = obs_batch[..., :23]
-    qvel = obs_batch[..., 23:45]
+    qpos = obs_batch[..., :NQ]
+    qvel = obs_batch[..., NQ:NQ + NV]
+
+    upper_target = obs_batch[..., TARGET_START:TARGET_START + 1]
+    fold_target = obs_batch[..., TARGET_START + 1:TARGET_START + 2]
+    last_action = obs_batch[..., LAST_ACTION_START:LAST_ACTION_START + 5]
 
     root_qpos = qpos[..., :7]
     root_qvel = qvel[..., :6]
 
-    mod_qpos = jp.reshape(qpos[..., 7:], (*obs_batch.shape[:-1], 4, 4))
-    mod_qvel = jp.reshape(qvel[..., 6:], (*obs_batch.shape[:-1], 4, 4))
+    root_vx = root_qvel[..., 0:1] / ROOT_VEL_SCALE
+    root_vz = root_qvel[..., 2:3] / ROOT_VEL_SCALE
+    root_wy = root_qvel[..., 4:5] / ROOT_VEL_SCALE
 
-    # body features
-    body_lin = root_qvel[..., 0:3]
-    body_ang = root_qvel[..., 3:6]
+    # qpos order after freejoint:
+    # 7  front_lower_fold_hinge
+    # 8  front_lower_wheel_hinge
+    # 9  rear_lower_fold_hinge
+    # 10 rear_lower_wheel_hinge
+    # 11 upper_swing_hinge
+    # 12 upper_wheel_hinge
+    front_fold = qpos[..., 7:8]
+    rear_fold = qpos[..., 9:10]
+    upper_angle = qpos[..., 11:12]
 
-    # module features
-    wheel_speed = mod_qvel[..., :, 0:1]
-    ext_pos = mod_qpos[..., :, 1:4]
-    ext_vel = mod_qvel[..., :, 1:4]
+    # qvel order after freejoint:
+    # 6  front_fold_vel
+    # 7  front_wheel_vel
+    # 8  rear_fold_vel
+    # 9  rear_wheel_vel
+    # 10 upper_angle_vel
+    # 11 upper_wheel_vel
+    front_fold_vel = qvel[..., 6:7]
+    front_wheel_vel = qvel[..., 7:8]
+    rear_fold_vel = qvel[..., 8:9]
+    rear_wheel_vel = qvel[..., 9:10]
+    upper_vel = qvel[..., 10:11]
+    upper_wheel_vel = qvel[..., 11:12]
 
-    ext_mean = jp.mean(ext_pos, axis=-1, keepdims=True)
-    ext_rate = jp.mean(ext_vel, axis=-1, keepdims=True)
+    # Approximate relative positions from joint angles.
+    # Convention: positive lower fold moves downward.
+    # Front lower wheel: +x, -y side.
+    front_wheel_x = LEG_LENGTH * jp.cos(front_fold)
+    front_wheel_y = -0.062 * jp.ones_like(front_wheel_x)
+    front_wheel_z = -LEG_LENGTH * jp.sin(front_fold)
 
-    rel_comp = ext_mean - jp.mean(ext_mean, axis=-2, keepdims=True)
+    # Rear lower wheel: -x, +y side.
+    # rear_fold is negative when folded downward, so z = L * sin(rear_fold).
+    rear_wheel_x = -LEG_LENGTH * jp.cos(-rear_fold)
+    rear_wheel_y = +0.062 * jp.ones_like(rear_wheel_x)
+    rear_wheel_z = LEG_LENGTH * jp.sin(rear_fold)
 
-    # crude body speed magnitude, broadcast to modules
-    body_speed = jp.linalg.norm(body_lin[..., :2], axis=-1, keepdims=True)
-    body_speed = body_speed[..., None, :]  # [..., 1, 1]
-    body_speed = jp.broadcast_to(body_speed, ext_mean.shape)
+    # Upper wheel: +x when stowed; positive upper_angle swings downward.
+    upper_wheel_x = LEG_LENGTH * jp.cos(upper_angle)
+    upper_wheel_y = jp.zeros_like(upper_wheel_x)
+    upper_wheel_z = -LEG_LENGTH * jp.sin(upper_angle)
 
-    # crude slip proxy
-    slip_proxy = jp.abs(wheel_speed) - body_speed
-
-    corner_id = jp.array(
-        [[1., -1.], [1., +1.], [-1., -1.], [-1., +1.]],
-        dtype=jp.float32
-    )
-    corner_id_b = jp.broadcast_to(corner_id, (*obs_batch.shape[:-1], 4, 2))
-    dummy = jp.zeros((*obs_batch.shape[:-1], 1), dtype=obs_batch.dtype)
-    body_raw = jp.concatenate([root_qpos, root_qvel], axis=-1)[..., None, :]
-
-    module_raw = jp.concatenate([
-        mod_qpos,
-        mod_qvel,
-        ext_mean,
-        ext_rate,
-        rel_comp,
-        corner_id_b,
-        body_speed,
-        slip_proxy
-         
+    # Limb centers are halfway to wheel centers.
+    hub_pos = jp.concatenate([
+        jp.zeros_like(front_wheel_x),
+        jp.zeros_like(front_wheel_x),
+        jp.zeros_like(front_wheel_x),
     ], axis=-1)
 
-    return body_raw, module_raw
+    front_leg_pos = 0.5 * jp.concatenate([front_wheel_x, front_wheel_y, front_wheel_z], axis=-1)
+    rear_leg_pos = 0.5 * jp.concatenate([rear_wheel_x, rear_wheel_y, rear_wheel_z], axis=-1)
+    upper_arm_pos = 0.5 * jp.concatenate([upper_wheel_x, upper_wheel_y, upper_wheel_z], axis=-1)
+
+    front_wheel_pos = jp.concatenate([front_wheel_x, front_wheel_y, front_wheel_z], axis=-1)
+    rear_wheel_pos = jp.concatenate([rear_wheel_x, rear_wheel_y, rear_wheel_z], axis=-1)
+    upper_wheel_pos = jp.concatenate([upper_wheel_x, upper_wheel_y, upper_wheel_z], axis=-1)
+
+    rel_pos = jp.stack([
+        hub_pos,
+        front_leg_pos,
+        rear_leg_pos,
+        upper_arm_pos,
+        front_wheel_pos,
+        rear_wheel_pos,
+        upper_wheel_pos,
+    ], axis=-2) / LEG_LENGTH
+
+    # Type one-hot: hub, leg, arm, wheel.
+    node_type = jp.array([
+        [1, 0, 0, 0],  # hub
+        [0, 1, 0, 0],  # front leg
+        [0, 1, 0, 0],  # rear leg
+        [0, 0, 1, 0],  # upper arm
+        [0, 0, 0, 1],  # front wheel
+        [0, 0, 0, 1],  # rear wheel
+        [0, 0, 0, 1],  # upper wheel
+    ], dtype=jp.float32)
+
+    batch_shape = obs_batch.shape[:-1]
+    node_type = jp.broadcast_to(node_type, (*batch_shape, NUM_NODES, 4))
+
+    side_sign = jp.array([
+        [0.0],   # hub
+        [+1.0],  # front leg
+        [-1.0],  # rear leg
+        [0.0],   # upper arm
+        [+1.0],  # front wheel
+        [-1.0],  # rear wheel
+        [0.0],   # upper wheel
+    ], dtype=jp.float32)
+    side_sign = jp.broadcast_to(side_sign, (*batch_shape, NUM_NODES, 1))
+
+    joint_angle = jp.stack([
+        jp.zeros_like(front_fold),
+        front_fold,
+        rear_fold,
+        upper_angle,
+        jp.zeros_like(front_fold),
+        jp.zeros_like(front_fold),
+        jp.zeros_like(front_fold),
+    ], axis=-2) / ANGLE_SCALE
+
+    joint_vel = jp.stack([
+        jp.zeros_like(front_fold_vel),
+        front_fold_vel,
+        rear_fold_vel,
+        upper_vel,
+        jp.zeros_like(front_fold_vel),
+        jp.zeros_like(front_fold_vel),
+        jp.zeros_like(front_fold_vel),
+    ], axis=-2) / JOINT_VEL_SCALE
+
+    wheel_vel = jp.stack([
+        jp.zeros_like(front_wheel_vel),
+        jp.zeros_like(front_wheel_vel),
+        jp.zeros_like(front_wheel_vel),
+        jp.zeros_like(front_wheel_vel),
+        front_wheel_vel,
+        rear_wheel_vel,
+        upper_wheel_vel,
+    ], axis=-2) / WHEEL_SPEED_SCALE
+
+    target_value = jp.stack([
+        jp.zeros_like(fold_target),
+        +fold_target,
+        -fold_target,
+        upper_target,
+        jp.zeros_like(fold_target),
+        jp.zeros_like(fold_target),
+        jp.zeros_like(fold_target),
+    ], axis=-2) / ANGLE_SCALE
+
+    root_features = jp.concatenate([
+        root_vx,
+        root_vz,
+        root_wy,
+    ], axis=-1)
+    root_features = jp.broadcast_to(
+        root_features[..., None, :],
+        (*batch_shape, NUM_NODES, root_features.shape[-1]),
+    )
+
+    node_features = jp.concatenate([
+        node_type,       # 4
+        side_sign,       # 1
+        rel_pos,         # 3
+        joint_angle,     # 1
+        joint_vel,       # 1
+        wheel_vel,       # 1
+        target_value,    # 1
+        root_features,   # 3
+    ], axis=-1)
+
+    global_features = jp.concatenate([
+        root_qpos,
+        root_qvel / 2.0,
+        upper_target / ANGLE_SCALE,
+        fold_target / ANGLE_SCALE,
+        last_action,
+    ], axis=-1)
+
+    return node_features, global_features
 
 # --------------------------
 # Small MLP + message passing
@@ -159,48 +343,39 @@ class MessagePassingLayer(nn.Module):
     hidden_dim: int
 
     @nn.compact
-    def __call__(self, h_nodes, obs_nodes):
+    def __call__(self, h_nodes, node_features):
         # h_nodes: [Bflat, N, H]
-        EXT_IDX, EXT_RATE_IDX, WHEEL_IDX = 8, 9, 4
-
-        ext       = obs_nodes[:, :, EXT_IDX]        # [B, N]
-        ext_rate  = obs_nodes[:, :, EXT_RATE_IDX]
-        wheel     = obs_nodes[:, :, WHEEL_IDX]
-
-        ext_s     = ext[:, SENDERS]                  # [B, E]
-        ext_r     = ext[:, RECEIVERS]
-        rate_s    = ext_rate[:, SENDERS]
-        rate_r    = ext_rate[:, RECEIVERS]
-        wheel_s   = wheel[:, SENDERS]
-        wheel_r   = wheel[:, RECEIVERS]
-
-        # Gate wheel diff to module-module edges only
-        is_mm = ((SENDERS != BODY) & (RECEIVERS != BODY)).astype(jp.float32)
-        wheel_diff = (wheel_s - wheel_r) * is_mm
-
-        dynamic_edge = jp.stack([
-            ext_s - ext_r,
-            rate_s - rate_r,
-            wheel_diff,
-        ], axis=-1)  # [B, E, 3]
+        # node_features: [Bflat, N, F]
 
         h_s = h_nodes[:, SENDERS, :]
         h_r = h_nodes[:, RECEIVERS, :]
         h_diff = h_s - h_r
 
+        x_s = node_features[:, SENDERS, :]
+        x_r = node_features[:, RECEIVERS, :]
+        x_diff = x_s - x_r
+
         static_edge = jp.broadcast_to(
             EDGE_ATTR[None],
             (h_nodes.shape[0], NUM_EDGES, EDGE_ATTR.shape[-1]),
         )
-        edge_features = jp.concatenate([static_edge, dynamic_edge], axis=-1)
 
-        m_in = jp.concatenate([h_s, h_r, h_diff, edge_features], axis=-1)
+        m_in = jp.concatenate([
+            h_s,
+            h_r,
+            h_diff,
+            x_s,
+            x_r,
+            x_diff,
+            static_edge,
+        ], axis=-1)
+
         m = MLP((self.hidden_dim, self.hidden_dim), activate_final=True)(m_in)
 
         agg = jp.einsum("beh,en->bnh", m, RECV_ONEHOT)
         agg = agg / RECV_DEG[None, :, None]
 
-        u_in = jp.concatenate([h_nodes, agg], axis=-1)
+        u_in = jp.concatenate([h_nodes, agg, node_features], axis=-1)
         delta = MLP((self.hidden_dim, self.hidden_dim), activate_final=True)(u_in)
 
         out = h_nodes + delta
@@ -216,49 +391,86 @@ class GraphPolicyModule(nn.Module):
     hidden_dim: int = 64
     num_mp_layers: int = 2
     noise_std_type: Literal["scalar", "log"] = "log"
-    init_noise_std: float = 1.0
+    init_noise_std: float = 0.5
 
     @nn.compact
     def __call__(self, obs_flat):
-        # obs_flat: [B, 45] (already normalized by preprocess fn)
-        body_raw, module_raw = parse_obs_to_nodes(obs_flat)
+        node_features, global_features = parse_obs_to_nodes(obs_flat)
 
-        body_h = MLP((self.hidden_dim, self.hidden_dim), activate_final=True)(body_raw)
-        mod_h = MLP((self.hidden_dim, self.hidden_dim), activate_final=True)(module_raw)
-        h = jp.concatenate([body_h, mod_h], axis=-2)  # [B, 5, H]
-        
-        body_obs_pad = jp.zeros(
-            (*obs_flat.shape[:-1], 1, module_raw.shape[-1]), dtype=obs_flat.dtype
-        )
-        obs_nodes = jp.concatenate([body_obs_pad, module_raw], axis=-2)  # [B, 5, obs_dim]
+        h = MLP((self.hidden_dim, self.hidden_dim), activate_final=True)(node_features)
 
         leading_shape = h.shape[:-2]
         hidden_size = h.shape[-1]
+
         h_flat = jp.reshape(h, (-1, NUM_NODES, hidden_size))
-        obs_flat_nodes = jp.reshape(obs_nodes, (-1, NUM_NODES, obs_nodes.shape[-1]))
+        x_flat = jp.reshape(node_features, (-1, NUM_NODES, node_features.shape[-1]))
 
         for _ in range(self.num_mp_layers):
-            h_flat = MessagePassingLayer(self.hidden_dim)(h_flat, obs_flat_nodes)
+            h_flat = MessagePassingLayer(self.hidden_dim)(h_flat, x_flat)
 
         h = jp.reshape(h_flat, (*leading_shape, NUM_NODES, hidden_size))
-        
-        if self.action_size % NUM_MODULES != 0:
-            raise ValueError(
-                f"action_size must be divisible by {NUM_MODULES}, got {self.action_size}"
-            )
 
-        per_module_action_dim = self.action_size // NUM_MODULES
-        h_body = jp.broadcast_to(h[..., 0:1, :], h[..., 1:5, :].shape)
-        actor_in = jp.concatenate([h[..., 1:5, :], h_body], axis=-1)
+        h_hub = h[..., HUB, :]
+        h_front_leg = h[..., FRONT_LEG, :]
+        h_rear_leg = h[..., REAR_LEG, :]
+        h_upper_arm = h[..., UPPER_ARM, :]
+        h_front_wheel = h[..., FRONT_WHEEL, :]
+        h_rear_wheel = h[..., REAR_WHEEL, :]
+        h_upper_wheel = h[..., UPPER_WHEEL, :]
 
-        out_fl = MLP((self.hidden_dim, self.hidden_dim, per_module_action_dim), activate_final=False)(actor_in[..., 0, :])
-        out_fr = MLP((self.hidden_dim, self.hidden_dim, per_module_action_dim), activate_final=False)(actor_in[..., 1, :])
-        out_rl = MLP((self.hidden_dim, self.hidden_dim, per_module_action_dim), activate_final=False)(actor_in[..., 2, :])
-        out_rr = MLP((self.hidden_dim, self.hidden_dim, per_module_action_dim), activate_final=False)(actor_in[..., 3, :])
+        # 1. lower common drive: shared lower-wheel propulsion
+        lower_common_in = jp.concatenate([
+            h_hub,
+            h_front_wheel + h_rear_wheel,
+            global_features,
+        ], axis=-1)
 
-        out = jp.stack([out_fl, out_fr, out_rl, out_rr], axis=-2)
-        
-        mean = jp.reshape(jp.swapaxes(out, -2, -1), (*leading_shape, self.action_size))
+        # 2. lower drive difference: front/rear imbalance
+        lower_diff_in = jp.concatenate([
+            h_front_wheel - h_rear_wheel,
+            h_front_leg - h_rear_leg,
+            h_hub,
+        ], axis=-1)
+
+        # 3. upper wheel drive
+        upper_wheel_in = jp.concatenate([
+            h_upper_wheel,
+            h_upper_arm,
+            h_hub,
+        ], axis=-1)
+
+        # 4. upper arm target delta
+        upper_arm_in = jp.concatenate([
+            h_upper_arm,
+            h_upper_wheel,
+            h_hub,
+            global_features,
+        ], axis=-1)
+
+        # 5. lower symmetric fold target delta
+        fold_in = jp.concatenate([
+            h_front_leg + h_rear_leg,
+            h_front_wheel + h_rear_wheel,
+            h_hub,
+            global_features,
+        ], axis=-1)
+
+        lower_common = MLP((self.hidden_dim, self.hidden_dim, 1))(lower_common_in)
+        lower_diff = MLP((self.hidden_dim, self.hidden_dim, 1))(lower_diff_in)
+        upper_wheel = MLP((self.hidden_dim, self.hidden_dim, 1))(upper_wheel_in)
+        upper_delta = MLP((self.hidden_dim, self.hidden_dim, 1))(upper_arm_in)
+        fold_delta = MLP((self.hidden_dim, self.hidden_dim, 1))(fold_in)
+
+        mean = jp.concatenate([
+            lower_common,
+            lower_diff,
+            upper_wheel,
+            upper_delta,
+            fold_delta,
+        ], axis=-1)
+
+        if self.action_size != 5:
+            raise ValueError(f"New robot graph policy expects action_size=5, got {self.action_size}")
 
         if self.noise_std_type == "scalar":
             log_std = self.param(
@@ -284,30 +496,31 @@ class GraphValueModule(nn.Module):
 
     @nn.compact
     def __call__(self, obs_flat):
-        body_raw, module_raw = parse_obs_to_nodes(obs_flat)
+        node_features, global_features = parse_obs_to_nodes(obs_flat)
 
-        body_h = MLP((self.hidden_dim, self.hidden_dim), activate_final=True)(body_raw)
-        mod_h = MLP((self.hidden_dim, self.hidden_dim), activate_final=True)(module_raw)
-
-        h = jp.concatenate([body_h, mod_h], axis=-2)
+        h = MLP((self.hidden_dim, self.hidden_dim), activate_final=True)(node_features)
 
         leading_shape = h.shape[:-2]
         hidden_size = h.shape[-1]
-        # Build obs_nodes for dynamic edges — pad body with zeros to match module dim
-        body_obs_pad = jp.zeros(
-            (*obs_flat.shape[:-1], 1, module_raw.shape[-1]), dtype=obs_flat.dtype
-        )
-        obs_nodes = jp.concatenate([body_obs_pad, module_raw], axis=-2)  # [B, 5, obs_dim]
+
         h_flat = jp.reshape(h, (-1, NUM_NODES, hidden_size))
-        obs_flat_nodes = jp.reshape(obs_nodes, (-1, NUM_NODES, obs_nodes.shape[-1]))
+        x_flat = jp.reshape(node_features, (-1, NUM_NODES, node_features.shape[-1]))
 
         for _ in range(self.num_mp_layers):
-            h_flat = MessagePassingLayer(self.hidden_dim)(h_flat, obs_flat_nodes)
+            h_flat = MessagePassingLayer(self.hidden_dim)(h_flat, x_flat)
 
         h = jp.reshape(h_flat, (*leading_shape, NUM_NODES, hidden_size))
 
-        flat = jp.reshape(h, (*leading_shape, NUM_NODES * hidden_size))
-        v = MLP((self.hidden_dim, self.hidden_dim, 1), activate_final=False)(flat)
+        h_mean = jp.mean(h, axis=-2)
+        h_hub = h[..., HUB, :]
+
+        value_in = jp.concatenate([
+            h_hub,
+            h_mean,
+            global_features,
+        ], axis=-1)
+
+        v = MLP((self.hidden_dim, self.hidden_dim, 1), activate_final=False)(value_in)
         return jp.squeeze(v, axis=-1)
 
 

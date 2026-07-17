@@ -35,6 +35,7 @@ import mujoco
 import mujoco_playground
 import tensorboardX
 import twmr  # noqa: F401 NOTE: added this for our environment
+import twmr.tombot_env as tombot_env
 from absl import app, flags, logging
 from brax.training.agents.ppo import networks as ppo_networks
 from brax.training.agents.ppo import networks_vision as ppo_networks_vision
@@ -60,7 +61,8 @@ except ImportError:
 
 import sys
 sys.path.append("/users/0/tang1014/tmwr/twmr-rl/sandbox/Tom")
-import graph_ppo_networks
+import phys_graph_ppo_networks
+import tombot_gnn
 
 
 
@@ -90,10 +92,11 @@ _PLAYGROUND_CONFIG_OVERRIDES = flags.DEFINE_string(
 )
 _VISION = flags.DEFINE_boolean("vision", False, "Use vision input")
 _LOAD_CHECKPOINT_PATH = flags.DEFINE_string(
-    "load_checkpoint_path",None, "Path to load checkpoint from"
+    "load_checkpoint_path", '/users/0/tang1014/tmwr/twmr-rl/logs/TombotRecovery-20260717-081350/checkpoints', "Path to load checkpoint from"
 )
 
 # gnn '/users/0/tang1014/tmwr/twmr-rl/logs/TransformableWheelMobileRobot-20260407-031936/checkpoints'
+# '/users/0/tang1014/tmwr/twmr-rl/logs/T-20260407-031936/checkpoints'
 _SUFFIX = flags.DEFINE_string("suffix", None, "Suffix for the experiment name")
 _PLAY_ONLY = flags.DEFINE_boolean(
     "play_only", False, "If true, only play with the model and do not train"
@@ -109,7 +112,7 @@ _USE_TB = flags.DEFINE_boolean(
 _DOMAIN_RANDOMIZATION = flags.DEFINE_boolean(
     "domain_randomization", False, "Use domain randomization"
 )
-_SEED = flags.DEFINE_integer("seed", 17, "Random seed")
+_SEED = flags.DEFINE_integer("seed", 717, "Random seed")
 _NUM_TIMESTEPS = flags.DEFINE_integer("num_timesteps", 1_000_000, "Number of timesteps")
 _NUM_VIDEOS = flags.DEFINE_integer(
     "num_videos", 1, "Number of videos to record after training."
@@ -145,7 +148,7 @@ _VALUE_HIDDEN_LAYER_SIZES = flags.DEFINE_list(
     "Value hidden layer sizes",
 )
 _POLICY_OBS_KEY = flags.DEFINE_string("policy_obs_key", "state", "Policy obs key")
-_VALUE_OBS_KEY = flags.DEFINE_string("value_obs_key", "state", "Value obs key")
+_VALUE_OBS_KEY = flags.DEFINE_string("value_obs_key", "privileged_state", "Value obs key")
 _RSCOPE_ENVS = flags.DEFINE_integer(
     "rscope_envs",
     None,
@@ -274,6 +277,12 @@ def main(argv):
     if _PLAYGROUND_CONFIG_OVERRIDES.value is not None:
         env_cfg_overrides = json.loads(_PLAYGROUND_CONFIG_OVERRIDES.value)
     env = registry.load(_ENV_NAME.value, config=env_cfg, config_overrides=env_cfg_overrides)
+    
+    print("REQUESTED ENV:", _ENV_NAME.value)
+    print("ENV CLASS:", type(env))
+    print("ENV MODULE:", type(env).__module__)
+    print("OBS SIZE:", env.observation_size)
+    print("ACTION SIZE:", env.action_size)
     if _RUN_EVALS.present:
         ppo_params.run_evals = _RUN_EVALS.value
     if _LOG_TRAINING_METRICS.present:
@@ -348,8 +357,37 @@ def main(argv):
     network_fn = (
         ppo_networks_vision.make_ppo_networks_vision
         if _VISION.value
-        else graph_ppo_networks.make_ppo_networks
+#         else phys_graph_ppo_networks.make_ppo_networks
+        else tombot_gnn.make_ppo_networks
     )
+    networks = network_fn(env.observation_size, env.action_size)
+    p_params = networks.policy_network.init(jax.random.PRNGKey(0))
+    v_params = networks.value_network.init(jax.random.PRNGKey(1))
+
+#     dummy_obs = {
+#         "state": jp.zeros((2, 22)),
+#         "privileged_state": jp.zeros((2, 32)),
+#     }
+
+    dummy_obs = {
+        key: jp.zeros((1,) + tuple(shape), dtype=jp.float32)
+        for key, shape in env.observation_size.items()
+    }
+
+    print(
+        "DUMMY OBS SHAPES:",
+        {key: value.shape for key, value in dummy_obs.items()},
+    )
+
+    assert dummy_obs["state"].shape == (1, 31)
+    assert dummy_obs["privileged_state"].shape == (1, 33)
+
+    policy_out = networks.policy_network.apply(None, p_params, dummy_obs)
+    value_out = networks.value_network.apply(None, v_params, dummy_obs)
+
+    print(policy_out.shape)  # expected: (2, 10)
+    print(value_out.shape)   # expected: (2,)
+    
     if hasattr(ppo_params, "network_factory"):
         network_factory = functools.partial(network_fn, **ppo_params.network_factory)
     else:
@@ -563,6 +601,7 @@ def main(argv):
 
     rng = jax.random.split(jax.random.PRNGKey(_SEED.value), _NUM_VIDEOS.value)
     reset_states = jax.jit(jax.vmap(eval_env.reset))(rng)
+    
     if _VISION.value:
         reset_states = jax.tree_util.tree_map(lambda x: x[0], reset_states)
     traj_stacked = jax.jit(jax.vmap(do_rollout))(rng, reset_states)
@@ -584,7 +623,7 @@ def main(argv):
     
     cam = mujoco.MjvCamera()
     cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-    cam.trackbodyid = eval_env.mj_model.body("root").id   # or whichever body you want
+    cam.trackbodyid = eval_env.mj_model.body("central_hub").id   # or whichever body you want
     cam.distance = 0.4    # smaller = closer
     cam.azimuth = 90
     cam.elevation = -20

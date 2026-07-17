@@ -1,0 +1,154 @@
+<mujoco model="tombot_ctrlrange_200_arm_10rpm_half_torque">
+  <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <default>
+    <joint damping="0.08" armature="0.002"/>
+    <geom rgba="0.65 0.65 0.65 1"
+      friction="0.8 0.02 0.002"
+      condim="3"
+      density="800"
+      contype="2"
+      conaffinity="1"/>
+    <motor ctrllimited="true" ctrlrange="-200 200"/>
+  </default>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.2 0.2 0.2" rgb2="0.3 0.3 0.3" width="300" height="300"/>
+    <material name="ground_mat" texture="grid" texrepeat="5 5"/>
+    <material name="chassis_mat" rgba="0.35 0.35 0.38 1"/>
+    <material name="arm_mat" rgba="0.2 0.35 0.75 1"/>
+    <material name="wheel_mat" rgba="0.04 0.04 0.04 1"/>
+    <material name="obstacle_mat" rgba="0.55 0.30 0.18 1"/>
+</asset>
+
+  <worldbody>
+    <light name="top" pos="0 0 1.2" dir="0 0 -1" diffuse="0.9 0.9 0.9"/>
+    <camera name="fixed" pos="0 -0.55 0.28" xyaxes="1 0 0 0 0.35 1"/>
+    <geom name="floor"
+      type="plane"
+      size="2 2 0.01"
+      material="ground_mat"
+      contype="1"
+      conaffinity="2"/>
+
+    <!-- Higher step obstacle for traversal. Robot front points toward negative y in this draft.
+         size = half-dimensions: 0.45m wide, 0.05m deep, 0.035m high. -->
+<!--     <geom name="step_obstacle" type="box" pos="0 -0.30 0.0175" size="0.225 0.025 0.0175" material="obstacle_mat" friction="0.8 0.01 0.001"/> -->
+
+    <!-- Body height set so the lower face of main_frame_box is 19.8 mm above the ground.
+         main_frame bottom = robot_z + 0.0182 - 0.0198 = 0.0198 m, so robot_z = 0.0214 m. -->
+    <body name="central_hub" pos="0 0 0.0214">
+      <freejoint name="root"/>
+      <site name="imu_site" pos="0 0.055 0.055" size="0.005"/>
+
+      <!-- STEP BREP #89: main frame. Coarse box substitute, not exact CAD mesh. -->
+      <geom name="main_frame_box" type="box" pos="0 0.0755 0.0182" size="0.066 0.0765 0.0198" material="chassis_mat" mass="0.28"/>
+
+      <!-- No artificial center ballast: extra mass is assigned to the rear/two-wheel thick leg assembly. -->
+
+      <!-- Passive middle support wheel under the chassis, placed on the centerline at the front arm hinge axis.
+           Radius = 12 mm, so its center is local z = 0.012 - robot_z = -0.0094 m and it starts on the floor. -->
+      <body name="middle_support_wheel" pos="0 0.016 -0.0094">
+        <joint name="middle_support_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.015"/>
+        <geom name="middle_support_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.012 0.0045" material="wheel_mat" mass="0.018"/>
+      </body>
+
+      <!-- Thick rear/two-wheel leg mass. This replaces the old front-arm ballast interpretation.
+           It represents the heavier rear assembly that carries the two rear wheels, shifting COM toward +y. -->
+      <geom name="rear_two_wheel_thick_leg_mass" type="box" pos="0 0.126 0.030" size="0.064 0.020 0.012" material="chassis_mat" mass="0.150" contype="0" conaffinity="0"/>
+
+      <!-- Rear wheels, STEP BREP #90 and #94. Cylinder axis is along local x. Wheel diameter = 55 mm. -->
+      <body name="rear_right_wheel" pos="0.055 0.138000002 0.0061">
+        <joint name="rear_right_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.02"/>
+        <geom name="rear_right_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.005" material="wheel_mat" mass="0.045"/>
+      </body>
+      <body name="rear_left_wheel" pos="-0.0575 0.138000002 0.0061">
+        <joint name="rear_left_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.02"/>
+        <geom name="rear_left_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.005" material="wheel_mat" mass="0.045"/>
+      </body>
+
+      <!-- Right transformable front arm, STEP BREP #91 + #92 + #93. Pivot inferred from arm upper end. -->
+      <body name="front_right_arm" pos="0.075 0.016 0.02">
+        <joint name="front_right_arm_hinge" type="hinge" axis="1 0 0" limited="true" range="-2.09439510 2.09439510" damping="0.18"/>
+        <geom name="front_right_arm_box" type="box" pos="0 -0.0625 0" size="0.0275 0.0775 0.018" material="arm_mat" mass="0.055"/>
+        <!-- Front transform motor/gearbox mount: kept symmetric/light; the thick two-wheel leg is the rear assembly. -->
+        <geom name="front_right_motor_mount" type="box" pos="0.0017 -0.123 -0.0139" size="0.0135 0.008 0.014" material="chassis_mat" mass="0.025"/>
+        <body name="front_right_wheel" pos="0.022775 -0.125 -0.0139">
+          <joint name="front_right_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.02"/>
+          <geom name="front_right_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.004575" material="wheel_mat" mass="0.040"/>
+        </body>
+      </body>
+
+      <!-- Left transformable front arm, STEP BREP #95 + mirrored mount + #96. -->
+      <body name="front_left_arm" pos="-0.075 0.016 0.02">
+        <joint name="front_left_arm_hinge" type="hinge" axis="1 0 0" limited="true" range="-2.09439510 2.09439510" damping="0.18"/>
+        <geom name="front_left_arm_box" type="box" pos="0 -0.0625 0" size="0.0275 0.0775 0.018" material="arm_mat" mass="0.055"/>
+        <!-- Front transform motor/gearbox mount: kept symmetric/light; the thick two-wheel leg is the rear assembly. -->
+        <geom name="front_left_motor_mount" type="box" pos="-0.0017 -0.123 -0.0139" size="0.0135 0.008 0.014" material="chassis_mat" mass="0.025"/>
+        <body name="front_left_wheel" pos="-0.022775 -0.125 -0.0139">
+          <joint name="front_left_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.02"/>
+          <geom name="front_left_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.004575" material="wheel_mat" mass="0.040"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+
+
+  <actuator>
+    <!-- Motor torque units in MuJoCo are N*m.
+         Your datasheet uses kgf*cm: 1 kgf*cm = 0.0980665 N*m.
+
+         Wheel motors:
+           rated: 80 rpm, 1.9 kgf*cm = 0.186326 N*m; safety limit used here: half-rated = 0.95 kgf*cm = 0.093163 N*m
+           no-load: 100 rpm = 10.472 rad/s
+           stall: 15.5 kgf*cm = 1.520031 N*m
+         The direct <motor> actuators below are limited to half of rated torque for safety.
+         With ctrlrange [-200, 200], ctrl=200 gives roughly +half-rated torque. -->
+    <motor name="rear_right_drive" joint="rear_right_wheel_spin" gear="0.000465815" ctrllimited="true" ctrlrange="-200 200"/>
+    <motor name="rear_left_drive" joint="rear_left_wheel_spin" gear="0.000465815" ctrllimited="true" ctrlrange="-200 200"/>
+    <motor name="front_right_drive" joint="front_right_wheel_spin" gear="0.000465815" ctrllimited="true" ctrlrange="-200 200"/>
+    <motor name="front_left_drive" joint="front_left_wheel_spin" gear="0.000465815" ctrllimited="true" ctrlrange="-200 200"/>
+
+    <!-- Wheg / transform arm motors:
+           speed limit used here: 10 rpm = 1.047198 rad/s
+           rated torque: 12 kgf*cm = 1.176798 N*m
+           safety torque used here: half-rated = 6 kgf*cm = 0.588399 N*m
+
+         These are velocity-servo actuators rather than pure torque motors.
+         ctrl now matches the motor-command scale [-200, 200]:
+           ctrl = +200 -> target +10 rpm
+           ctrl = -200 -> target -10 rpm
+
+         The gear maps motor command to joint speed:
+           gear = 200 / 1.047198 = 190.9859, so qvel_target = ctrl / gear.
+
+         MuJoCo clamps actuator force, not directly joint torque.
+         With gear=190.9859 and forcerange=+/-0.00308085,
+         max joint torque is gear * force = 0.588399 N*m. -->
+    <velocity name="front_right_transform" joint="front_right_arm_hinge"
+              gear="190.985932" kv="5.0"
+              ctrllimited="true" ctrlrange="-200 200"
+              forcelimited="true" forcerange="-0.003080850 0.003080850"/>
+    <velocity name="front_left_transform" joint="front_left_arm_hinge"
+              gear="190.985932" kv="5.0"
+              ctrllimited="true" ctrlrange="-200 200"
+              forcelimited="true" forcerange="-0.003080850 0.003080850"/>
+  </actuator>
+
+  <sensor>
+    <gyro name="body_gyro" site="imu_site"/>
+    <accelerometer name="body_acc" site="imu_site"/>
+    <framequat name="body_quat" objtype="site" objname="imu_site"/>
+    <jointvel name="rear_right_wheel_vel" joint="rear_right_wheel_spin"/>
+    <jointvel name="rear_left_wheel_vel" joint="rear_left_wheel_spin"/>
+    <jointvel name="front_right_wheel_vel" joint="front_right_wheel_spin"/>
+    <jointvel name="front_left_wheel_vel" joint="front_left_wheel_spin"/>
+    <jointvel name="middle_support_wheel_vel" joint="middle_support_wheel_spin"/>
+    <jointpos name="front_right_arm_angle" joint="front_right_arm_hinge"/>
+    <jointpos name="front_left_arm_angle" joint="front_left_arm_hinge"/>
+    <jointvel name="front_right_arm_vel" joint="front_right_arm_hinge"/>
+    <jointvel name="front_left_arm_vel" joint="front_left_arm_hinge"/>
+  </sensor>
+</mujoco>
