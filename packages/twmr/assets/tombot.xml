@@ -1,6 +1,7 @@
 <mujoco model="tombot_ctrlrange_200_arm_10rpm_half_torque">
   <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
-  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+  <!-- implicitfast integrates the arm velocity-servo damping implicitly (RK4 made it chatter). -->
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
 
   <default>
     <joint damping="0.08" armature="0.002"/>
@@ -8,10 +9,25 @@
       friction="0.8 0.02 0.002"
       condim="3"
       density="800"
-      contype="2"
-      conaffinity="1"/>
+      contype="10"
+      conaffinity="5"/>
     <motor ctrllimited="true" ctrlrange="-200 200"/>
+    <!-- Wheel cylinders: floor contact only (MJX-JAX has no cylinder-box collision). -->
+    <default class="wheel">
+      <geom contype="2" conaffinity="1"/>
+    </default>
+    <!-- Invisible spheres with the wheel radius: obstacle contact only. -->
+    <default class="wheel_obstacle_proxy">
+      <geom type="sphere" contype="8" conaffinity="4" density="0" group="3" rgba="0 0 0 0"/>
+    </default>
   </default>
+  <!-- Collision bitmasks:
+         floor            contype 1  conaffinity 2
+         robot boxes      contype 10 conaffinity 5  -> floor and obstacle
+         wheel cylinders  contype 2  conaffinity 1  -> floor only
+         wheel proxies    contype 8  conaffinity 4  -> obstacle only
+         obstacle         contype 4  conaffinity 8  -> robot only (never the floor)
+       Robot geoms never collide with each other. -->
 
   <asset>
     <texture name="grid" type="2d" builtin="checker" rgb1="0.2 0.2 0.2" rgb2="0.3 0.3 0.3" width="300" height="300"/>
@@ -32,9 +48,14 @@
       contype="1"
       conaffinity="2"/>
 
-    <!-- Higher step obstacle for traversal. Robot front points toward negative y in this draft.
-         size = half-dimensions: 0.45m wide, 0.05m deep, 0.035m high. -->
-<!--     <geom name="step_obstacle" type="box" pos="0 -0.30 0.0175" size="0.225 0.025 0.0175" material="obstacle_mat" friction="0.8 0.01 0.001"/> -->
+    <!-- Step obstacle. Robot front points toward negative y.
+         Mocap body: the env sets its position every episode. The visible step height is
+         controlled by sinking the 5 cm box into the floor (box top = mocap z + 0.025),
+         and episodes without an obstacle sink it completely.
+         size = half-dimensions: 0.6 m wide, 0.05 m deep, up to 0.05 m high. -->
+    <body name="step_obstacle" mocap="true" pos="0 -0.35 -0.03">
+      <geom name="step_obstacle_geom" type="box" size="0.3 0.025 0.025" contype="4" conaffinity="8" material="obstacle_mat" friction="0.8 0.01 0.001"/>
+    </body>
 
     <!-- Body height set so the lower face of main_frame_box is 19.8 mm above the ground.
          main_frame bottom = robot_z + 0.0182 - 0.0198 = 0.0198 m, so robot_z = 0.0214 m. -->
@@ -51,7 +72,8 @@
            Radius = 12 mm, so its center is local z = 0.012 - robot_z = -0.0094 m and it starts on the floor. -->
       <body name="middle_support_wheel" pos="0 0.016 -0.0094">
         <joint name="middle_support_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.015"/>
-        <geom name="middle_support_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.012 0.0045" material="wheel_mat" mass="0.018"/>
+        <geom name="middle_support_wheel_geom" class="wheel" type="cylinder" euler="0 1.57079632679 0" size="0.012 0.0045" material="wheel_mat" mass="0.018"/>
+        <geom name="middle_support_wheel_proxy" class="wheel_obstacle_proxy" size="0.012"/>
       </body>
 
       <!-- Thick rear/two-wheel leg mass. This replaces the old front-arm ballast interpretation.
@@ -61,11 +83,13 @@
       <!-- Rear wheels, STEP BREP #90 and #94. Cylinder axis is along local x. Wheel diameter = 55 mm. -->
       <body name="rear_right_wheel" pos="0.055 0.138000002 0.0061">
         <joint name="rear_right_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.02"/>
-        <geom name="rear_right_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.005" material="wheel_mat" mass="0.045"/>
+        <geom name="rear_right_wheel_geom" class="wheel" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.005" material="wheel_mat" mass="0.045"/>
+        <geom name="rear_right_wheel_proxy" class="wheel_obstacle_proxy" size="0.0275"/>
       </body>
       <body name="rear_left_wheel" pos="-0.0575 0.138000002 0.0061">
         <joint name="rear_left_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.02"/>
-        <geom name="rear_left_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.005" material="wheel_mat" mass="0.045"/>
+        <geom name="rear_left_wheel_geom" class="wheel" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.005" material="wheel_mat" mass="0.045"/>
+        <geom name="rear_left_wheel_proxy" class="wheel_obstacle_proxy" size="0.0275"/>
       </body>
 
       <!-- Right transformable front arm, STEP BREP #91 + #92 + #93. Pivot inferred from arm upper end. -->
@@ -76,7 +100,8 @@
         <geom name="front_right_motor_mount" type="box" pos="0.0017 -0.123 -0.0139" size="0.0135 0.008 0.014" material="chassis_mat" mass="0.025"/>
         <body name="front_right_wheel" pos="0.022775 -0.125 -0.0139">
           <joint name="front_right_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.02"/>
-          <geom name="front_right_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.004575" material="wheel_mat" mass="0.040"/>
+          <geom name="front_right_wheel_geom" class="wheel" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.004575" material="wheel_mat" mass="0.040"/>
+          <geom name="front_right_wheel_proxy" class="wheel_obstacle_proxy" size="0.0275"/>
         </body>
       </body>
 
@@ -88,7 +113,8 @@
         <geom name="front_left_motor_mount" type="box" pos="-0.0017 -0.123 -0.0139" size="0.0135 0.008 0.014" material="chassis_mat" mass="0.025"/>
         <body name="front_left_wheel" pos="-0.022775 -0.125 -0.0139">
           <joint name="front_left_wheel_spin" type="hinge" axis="1 0 0" limited="false" damping="0.02"/>
-          <geom name="front_left_wheel_geom" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.004575" material="wheel_mat" mass="0.040"/>
+          <geom name="front_left_wheel_geom" class="wheel" type="cylinder" euler="0 1.57079632679 0" size="0.0275 0.004575" material="wheel_mat" mass="0.040"/>
+          <geom name="front_left_wheel_proxy" class="wheel_obstacle_proxy" size="0.0275"/>
         </body>
       </body>
     </body>
@@ -126,13 +152,17 @@
 
          MuJoCo clamps actuator force, not directly joint torque.
          With gear=190.9859 and forcerange=+/-0.00308085,
-         max joint torque is gear * force = 0.588399 N*m. -->
+         max joint torque is gear * force = 0.588399 N*m.
+
+         Joint-level speed-loop gain = kv * gear^2. kv=5 gave ~1.8e5 N*m*s/rad, so the force was
+         saturated on every substep (bang-bang +/-0.588 N*m chatter). kv=1.4e-4 gives ~5 N*m*s/rad:
+         full torque for speed errors above ~0.12 rad/s, proportional below. -->
     <velocity name="front_right_transform" joint="front_right_arm_hinge"
-              gear="190.985932" kv="5.0"
+              gear="190.985932" kv="1.4e-4"
               ctrllimited="true" ctrlrange="-200 200"
               forcelimited="true" forcerange="-0.003080850 0.003080850"/>
     <velocity name="front_left_transform" joint="front_left_arm_hinge"
-              gear="190.985932" kv="5.0"
+              gear="190.985932" kv="1.4e-4"
               ctrllimited="true" ctrlrange="-200 200"
               forcelimited="true" forcerange="-0.003080850 0.003080850"/>
   </actuator>

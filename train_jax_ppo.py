@@ -23,7 +23,7 @@ xla_flags = os.environ.get("XLA_FLAGS", "")
 xla_flags += " --xla_gpu_triton_gemm_any=True"
 os.environ["XLA_FLAGS"] = xla_flags
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["MUJOCO_GL"] = "egl"
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 import time
 import warnings
@@ -49,10 +49,7 @@ from mujoco_playground.config import (
     manipulation_params,
 )
 
-import csv
 progress_rows = []
-metrics_csv_path = None
-metrics_csv_header_written = False
 
 try:
     import wandb
@@ -60,8 +57,8 @@ except ImportError:
     wandb = None
 
 import sys
-sys.path.append("/users/0/tang1014/tmwr/twmr-rl/sandbox/Tom")
-import phys_graph_ppo_networks
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent / "sandbox" / "Tom"))
 import tombot_gnn
 
 
@@ -92,7 +89,17 @@ _PLAYGROUND_CONFIG_OVERRIDES = flags.DEFINE_string(
 )
 _VISION = flags.DEFINE_boolean("vision", False, "Use vision input")
 _LOAD_CHECKPOINT_PATH = flags.DEFINE_string(
-    "load_checkpoint_path", '/users/0/tang1014/tmwr/twmr-rl/logs/TombotRecovery-20260717-081350/checkpoints', "Path to load checkpoint from"
+    "load_checkpoint_path", None, "Path to load checkpoint from"
+)
+_RESTORE_VALUE_FN = flags.DEFINE_boolean(
+    "restore_value_fn", True,
+    "When loading a checkpoint, also restore the critic. Use False only if the reward "
+    "or critic observation changed; a fresh critic gives poor advantages at first.",
+)
+_DETERMINISTIC_EVAL = flags.DEFINE_boolean(
+    "deterministic_eval", True,
+    "Evaluate with the deterministic (mean) action. Stochastic eval mixes exploration "
+    "noise into the eval reward and can hide what the policy actually does.",
 )
 
 # gnn '/users/0/tang1014/tmwr/twmr-rl/logs/TransformableWheelMobileRobot-20260407-031936/checkpoints'
@@ -178,7 +185,41 @@ _TRAINING_METRICS_STEPS = flags.DEFINE_integer(
 )
 
 
+def tombot_ppo_config() -> config_dict.ConfigDict:
+    """PPO settings for TombotRecovery (GPU scale).
+
+    Rewards are O(1) per step, so reward_scaling stays 1. A small learning rate and
+    few epochs per batch keep the per-update KL ~0.01-0.02.
+    """
+    return config_dict.create(
+        num_timesteps=200_000_000,
+        num_evals=20,
+        reward_scaling=1.0,
+        episode_length=1000,
+        normalize_observations=False,  # the GNN networks ignore the normalizer
+        action_repeat=1,
+        unroll_length=20,
+        num_minibatches=32,
+        num_updates_per_batch=4,
+        discounting=0.99,
+        learning_rate=3e-4,
+        entropy_cost=3e-3,
+        num_envs=2048,
+        num_eval_envs=128,
+        batch_size=1024,
+        max_grad_norm=1.0,
+        network_factory=config_dict.create(
+            policy_obs_key="state",
+            value_obs_key="privileged_state",
+            value_hidden_layer_sizes=(256, 256, 256),
+            init_noise_std=0.5,
+        ),
+    )
+
+
 def get_rl_config(env_name: str) -> config_dict.ConfigDict:
+    if env_name.startswith("Tombot"):
+        return tombot_ppo_config()
     if env_name in mujoco_playground.manipulation._envs:
         if _VISION.value:
             return manipulation_params.brax_vision_ppo_config(env_name, _IMPL.value)
@@ -224,7 +265,7 @@ def main(argv):
 
     if _NUM_TIMESTEPS.present:
         ppo_params.num_timesteps = _NUM_TIMESTEPS.value
-    if _PLAY_ONLY.present:
+    if _PLAY_ONLY.value:
         ppo_params.num_timesteps = 0
     if _NUM_EVALS.present:
         ppo_params.num_evals = _NUM_EVALS.value
@@ -307,7 +348,7 @@ def main(argv):
     logdir = epath.Path("logs").resolve() / exp_name
     logdir.mkdir(parents=True, exist_ok=True)
     print(f"Logs are being stored in: {logdir}")
-    metrics_csv_path = os.path.join(logdir, "training_metrics.csv")
+    metrics_jsonl_path = os.path.join(logdir, "training_metrics.jsonl")
 
     # Initialize Weights & Biases if required
     if _USE_WANDB.value and not _PLAY_ONLY.value:
@@ -379,14 +420,20 @@ def main(argv):
         {key: value.shape for key, value in dummy_obs.items()},
     )
 
-    assert dummy_obs["state"].shape == (1, 31)
-    assert dummy_obs["privileged_state"].shape == (1, 33)
+    if _ENV_NAME.value.startswith("Tombot"):
+        expected = {
+            "state": (tombot_gnn.ACTOR_OBS_SIZE,),
+            "privileged_state": (tombot_gnn.PRIV_OBS_SIZE,),
+        }
+        if dict(env.observation_size) != expected:
+            raise ValueError(
+                f"Env observation sizes {dict(env.observation_size)} do not match the "
+                f"GNN layout {expected}. Update sandbox/Tom/tombot_gnn.py."
+            )
 
     policy_out = networks.policy_network.apply(None, p_params, dummy_obs)
     value_out = networks.value_network.apply(None, v_params, dummy_obs)
-
-    print(policy_out.shape)  # expected: (2, 10)
-    print(value_out.shape)   # expected: (2,)
+    print("policy output:", policy_out.shape, "value output:", value_out.shape)
     
     if hasattr(ppo_params, "network_factory"):
         network_factory = functools.partial(network_fn, **ppo_params.network_factory)
@@ -438,17 +485,20 @@ def main(argv):
         network_factory=network_factory,
         seed=_SEED.value,
         restore_checkpoint_path=restore_checkpoint_path,
+        restore_value_fn=_RESTORE_VALUE_FN.value,
         save_checkpoint_path=ckpt_path,
-        wrap_env_fn=None if _VISION.value else wrapper.wrap_for_brax_training,
+        # full_reset: every episode gets a fresh random reset, and env.info (stall timer,
+        # obstacle flags, observation history) does not leak between episodes.
+        wrap_env_fn=None if _VISION.value else functools.partial(
+            wrapper.wrap_for_brax_training, full_reset=True),
         num_eval_envs=num_eval_envs,
+        deterministic_eval=_DETERMINISTIC_EVAL.value,
     )
 
     times = [time.monotonic()]
 
 
     def progress(num_steps, metrics):
-        global metrics_csv_header_written
-
         times.append(time.monotonic())
 
         row = {"num_steps": int(num_steps)}
@@ -460,15 +510,10 @@ def main(argv):
 
         progress_rows.append(row)
 
-        # append to CSV every callback
-        if metrics_csv_path is not None:
-            fieldnames = ["num_steps"] + sorted(k for k in row.keys() if k != "num_steps")
-            with open(metrics_csv_path, "a", newline="") as f:
-                writer_csv = csv.DictWriter(f, fieldnames=fieldnames)
-                if not metrics_csv_header_written:
-                    writer_csv.writeheader()
-                    metrics_csv_header_written = True
-                writer_csv.writerow(row)
+        # One JSON object per callback. (Eval and training callbacks carry
+        # different keys, which a single CSV header cannot represent.)
+        with open(metrics_jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
 
         # Log to Weights & Biases
         if _USE_WANDB.value and not _PLAY_ONLY.value:

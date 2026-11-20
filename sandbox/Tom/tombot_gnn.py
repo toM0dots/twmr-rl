@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any, Literal, Sequence
 
@@ -17,42 +18,43 @@ from brax.training import types
 # Observation layouts shared with tombot_env.py
 # ============================================================
 
-# Actor observation: hardware-style and matched to the new XML.
+# Actor observation: proprioception only (no forward-looking sensor), plus history.
 #
-# Layout:
-#   0:4      body quaternion from body_quat
-#   4:7      body gyro
-#   7:10     body accelerometer
-#   10:16    normalized signed motor-effort/current proxies
-#             [rear-right wheel, rear-left wheel,
-#              front-right wheel, front-left wheel,
-#              front-right transform, front-left transform]
-#   16:21    normalized wheel velocities
-#             [rear-right, rear-left, front-right, front-left,
-#              passive middle support]
-#   21:23    normalized arm angles [front-right, front-left]
-#   23:25    normalized arm velocities [front-right, front-left]
-#   25:31    previous normalized 6D policy action
+# One frame (24):
+#   0:3    gravity direction in the body frame
+#   3:6    body gyro / 10
+#   6:9    body accelerometer / 9.81
+#   9:15   signed motor-effort/current proxies
+#          [rear-right, rear-left, front-right, front-left wheel, right arm, left arm]
+#   15:20  wheel velocities [rear-right, rear-left, front-right, front-left, middle]
+#   20:22  arm angles [front-right, front-left]
+#   22:24  arm velocities [front-right, front-left]
+# Actor observation:
+#   0:24    current frame
+#   24:30   previous normalized 6D action
+#   30:102  frames from HIST_OFFSETS control steps ago
 #
-# Total = 31
-ACTOR_OBS_SIZE = 31
+# Must match packages/twmr/src/twmr/tombot_env.py.
+FRAME_SIZE = 24
+HIST_OFFSETS = (5, 10, 20)
+NUM_HIST = len(HIST_OFFSETS)
+ACTION_SIZE = 6
+ACTOR_OBS_SIZE = FRAME_SIZE + ACTION_SIZE + FRAME_SIZE * NUM_HIST  # 102
 
-QUAT_START = 0
-GYRO_START = 4
-ACCEL_START = 7
-CURRENT_START = 10
-WHEEL_VEL_START = 16
-ARM_ANGLE_START = 21
-ARM_VEL_START = 23
-LAST_ACTION_START = 25
+GRAVITY_START = 0
+GYRO_START = 3
+ACCEL_START = 6
+IMU_SIZE = 9
+CURRENT_START = 9
+WHEEL_VEL_START = 15
+ARM_ANGLE_START = 20
+ARM_VEL_START = 22
+LAST_ACTION_START = FRAME_SIZE
+HIST_START = FRAME_SIZE + ACTION_SIZE
 
-# Critic observation:
-#   qpos:        14
-#   qvel:        13
-#   last_action:  6
-#
-# Total = 33
-PRIV_OBS_SIZE = 33
+# Privileged critic observation: root position, arm angles, rotation (6D), qvel,
+# previous action and task state (obstacle, stall, level, heading). See the env.
+PRIV_OBS_SIZE = 39
 
 
 # ============================================================
@@ -237,35 +239,60 @@ class SmallActionHead(nn.Module):
 # Actor observation parser
 # ============================================================
 
+def _frame_node_signals(frame: jp.ndarray) -> tuple[jp.ndarray, jp.ndarray, jp.ndarray]:
+    """Per-node (current, position, velocity) from one 24D frame -> 3 x [..., 8, 1]."""
+    currents = frame[..., CURRENT_START:CURRENT_START + 6]
+    wheel_vel = frame[..., WHEEL_VEL_START:WHEEL_VEL_START + 5]
+    arm_angle = frame[..., ARM_ANGLE_START:ARM_ANGLE_START + 2]
+    arm_vel = frame[..., ARM_VEL_START:ARM_VEL_START + 2]
+    z = jp.zeros_like(currents[..., 0:1])
+
+    # Current/action order matches the XML actuator order.
+    node_current = jp.stack([
+        z,                    # HUB
+        z,                    # MIDDLE_SUPPORT
+        currents[..., 0:1],   # REAR_RIGHT_WHEEL
+        currents[..., 1:2],   # REAR_LEFT_WHEEL
+        currents[..., 2:3],   # FRONT_RIGHT_WHEEL
+        currents[..., 3:4],   # FRONT_LEFT_WHEEL
+        currents[..., 4:5],   # FRONT_RIGHT_ARM
+        currents[..., 5:6],   # FRONT_LEFT_ARM
+    ], axis=-2)
+    node_position = jp.stack([z, z, z, z, z, z, arm_angle[..., 0:1], arm_angle[..., 1:2]], axis=-2)
+    node_velocity = jp.stack([
+        z,
+        wheel_vel[..., 4:5],
+        wheel_vel[..., 0:1],
+        wheel_vel[..., 1:2],
+        wheel_vel[..., 2:3],
+        wheel_vel[..., 3:4],
+        arm_vel[..., 0:1],
+        arm_vel[..., 1:2],
+    ], axis=-2)
+    return node_current, node_position, node_velocity
+
+
 def parse_actor_obs_to_nodes(obs: jp.ndarray) -> tuple[jp.ndarray, jp.ndarray]:
-    """Converts the 31D actor observation into eight graph nodes.
+    """Converts the actor observation into eight graph nodes.
 
     Args:
-      obs: shape [..., 31]
+      obs: shape [..., ACTOR_OBS_SIZE]
 
     Returns:
       node_features: shape [..., 8, node_dim]
-      global_features: shape [..., 10], containing only IMU information
+      global_features: shape [..., IMU_SIZE * (1 + NUM_HIST)]: IMU now and in the past
     """
-
     if obs.shape[-1] != ACTOR_OBS_SIZE:
         raise ValueError(
             f"Graph actor expects {ACTOR_OBS_SIZE}D actor obs, got {obs.shape[-1]}."
         )
 
-    quat = obs[..., QUAT_START:QUAT_START + 4]
-    gyro = obs[..., GYRO_START:GYRO_START + 3]
-    accel = obs[..., ACCEL_START:ACCEL_START + 3]
-    currents = obs[..., CURRENT_START:CURRENT_START + 6]
-    wheel_vel = obs[..., WHEEL_VEL_START:WHEEL_VEL_START + 5]
-    arm_angle = obs[..., ARM_ANGLE_START:ARM_ANGLE_START + 2]
-    arm_vel = obs[..., ARM_VEL_START:ARM_VEL_START + 2]
-    last_action = obs[..., LAST_ACTION_START:LAST_ACTION_START + 6]
-
     batch_shape = obs.shape[:-1]
+    frame = obs[..., :FRAME_SIZE]
+    last_action = obs[..., LAST_ACTION_START:LAST_ACTION_START + ACTION_SIZE]
+    hist = jp.reshape(obs[..., HIST_START:], (*batch_shape, NUM_HIST, FRAME_SIZE))
 
-    node_id = jp.eye(NUM_NODES, dtype=jp.float32)
-    node_id = jp.broadcast_to(node_id, (*batch_shape, NUM_NODES, NUM_NODES))
+    node_id = jp.broadcast_to(jp.eye(NUM_NODES, dtype=jp.float32), (*batch_shape, NUM_NODES, NUM_NODES))
 
     # Types: hub, passive wheel, driven wheel, transform arm.
     node_type = jp.array([
@@ -293,43 +320,18 @@ def parse_actor_obs_to_nodes(obs: jp.ndarray) -> tuple[jp.ndarray, jp.ndarray]:
     ], dtype=jp.float32)
     node_role = jp.broadcast_to(node_role, (*batch_shape, NUM_NODES, 4))
 
-    imu_global = jp.concatenate([quat, gyro, accel], axis=-1)
-    imu_tiled = jp.broadcast_to(
-        imu_global[..., None, :],
-        (*batch_shape, NUM_NODES, imu_global.shape[-1]),
-    )
+    imu_now = frame[..., :IMU_SIZE]
+    imu_tiled = jp.broadcast_to(imu_now[..., None, :], (*batch_shape, NUM_NODES, IMU_SIZE))
+    global_features = jp.concatenate(
+        [imu_now, jp.reshape(hist[..., :IMU_SIZE], (*batch_shape, NUM_HIST * IMU_SIZE))], axis=-1)
 
-    z = jp.zeros_like(currents[..., 0:1])
+    node_current, node_position, node_velocity = _frame_node_signals(frame)
 
-    # Current/action order exactly matches the XML actuator order.
-    node_current = jp.stack([
-        z,                    # HUB
-        z,                    # MIDDLE_SUPPORT
-        currents[..., 0:1],  # REAR_RIGHT_WHEEL
-        currents[..., 1:2],  # REAR_LEFT_WHEEL
-        currents[..., 2:3],  # FRONT_RIGHT_WHEEL
-        currents[..., 3:4],  # FRONT_LEFT_WHEEL
-        currents[..., 4:5],  # FRONT_RIGHT_ARM
-        currents[..., 5:6],  # FRONT_LEFT_ARM
-    ], axis=-2)
+    # Per-node history: what this joint's current/position/velocity were 0.1-0.4 s ago.
+    hist_signals = [_frame_node_signals(hist[..., i, :]) for i in range(NUM_HIST)]
+    node_history = jp.concatenate([sig for signals in hist_signals for sig in signals], axis=-1)
 
-    node_position = jp.stack([
-        z, z, z, z, z, z,
-        arm_angle[..., 0:1],
-        arm_angle[..., 1:2],
-    ], axis=-2)
-
-    node_velocity = jp.stack([
-        z,
-        wheel_vel[..., 4:5],
-        wheel_vel[..., 0:1],
-        wheel_vel[..., 1:2],
-        wheel_vel[..., 2:3],
-        wheel_vel[..., 3:4],
-        arm_vel[..., 0:1],
-        arm_vel[..., 1:2],
-    ], axis=-2)
-
+    z = jp.zeros_like(last_action[..., 0:1])
     node_relevant_action = jp.stack([
         z,
         z,
@@ -340,25 +342,23 @@ def parse_actor_obs_to_nodes(obs: jp.ndarray) -> tuple[jp.ndarray, jp.ndarray]:
         last_action[..., 4:5],
         last_action[..., 5:6],
     ], axis=-2)
-
     last_action_tiled = jp.broadcast_to(
-        last_action[..., None, :],
-        (*batch_shape, NUM_NODES, last_action.shape[-1]),
-    )
+        last_action[..., None, :], (*batch_shape, NUM_NODES, ACTION_SIZE))
 
     node_features = jp.concatenate([
         node_id,                 # 8
         node_type,               # 4
         node_role,               # 4
-        imu_tiled,               # 10
+        imu_tiled,               # 9
         node_current,            # 1
         node_position,           # 1
         node_velocity,           # 1
         node_relevant_action,    # 1
+        node_history,            # 3 * NUM_HIST
         last_action_tiled,       # 6
     ], axis=-1)
 
-    return node_features, imu_global
+    return node_features, global_features
 
 
 # ============================================================
@@ -437,10 +437,12 @@ class GraphActorModule(nn.Module):
     num_mp_layers: int = 1
     activation: Any = nn.swish
 
-    noise_std_type: Literal["scalar", "log"] = "scalar"
-    init_noise_std: float = 0.10
-    min_noise_std: float = 0.03
-    max_noise_std: float = 0.25
+    # Brax's distributions apply softplus(x) + min_std to this output, so the
+    # parameter is stored pre-softplus and is never hard-clipped (a clip zeroes its
+    # gradient and the std gets stuck at the bound).
+    noise_std_type: Literal["scalar", "per_action"] = "per_action"
+    init_noise_std: float = 0.5
+    min_noise_std: float = 1e-3
 
     use_residual_gate: bool = True
     init_residual_alpha: float = 0.10
@@ -548,34 +550,21 @@ class GraphActorModule(nn.Module):
         #   front_right_transform, front_left_transform.
         mean = jp.concatenate([wheel_mean, arm_mean], axis=-1)
 
-        init_log_std = jp.log(self.init_noise_std)
+        target = max(self.init_noise_std - self.min_noise_std, 1e-4)
+        init_param = math.log(math.expm1(target))   # inverse softplus
         if self.noise_std_type == "scalar":
-            log_std = self.param(
-                "log_std",
-                nn.initializers.constant(init_log_std),
-                (1,),
-            )
-            log_std = jp.broadcast_to(log_std, mean.shape)
-        elif self.noise_std_type == "log":
-            log_std = self.param(
-                "log_std",
-                nn.initializers.constant(init_log_std),
-                (self.action_size,),
-            )
-            log_std = jp.broadcast_to(log_std, mean.shape)
+            shape = (1,)
+        elif self.noise_std_type == "per_action":
+            shape = (self.action_size,)
         else:
             raise ValueError(f"Unsupported noise_std_type={self.noise_std_type}")
-
-        log_std = jp.clip(
-            log_std,
-            jp.log(self.min_noise_std),
-            jp.log(self.max_noise_std),
-        )
-        return jp.concatenate([mean, log_std], axis=-1)
+        std_param = self.param("std_param", nn.initializers.constant(init_param), shape)
+        std_param = jp.broadcast_to(std_param, mean.shape)
+        return jp.concatenate([mean, std_param], axis=-1)
 
 
 # ============================================================
-# Privileged critic: qpos/qvel + previous action
+# Privileged critic: simulator state + task state
 # ============================================================
 
 class PrivilegedValueModule(nn.Module):
@@ -652,8 +641,8 @@ def make_ppo_networks(
     policy_obs_key: str = "state",
     value_obs_key: str = "privileged_state",
     distribution_type: Literal["normal", "tanh_normal"] = "tanh_normal",
-    noise_std_type: Literal["scalar", "log"] = "scalar",
-    init_noise_std: float = 0.10,
+    noise_std_type: Literal["scalar", "per_action"] = "per_action",
+    init_noise_std: float = 0.5,
     state_dependent_std: bool = False,
     **kwargs: Any,
 ) -> PPONetworks:
@@ -666,10 +655,12 @@ def make_ppo_networks(
             f"got action_size={action_size}."
         )
 
+    min_noise_std = kwargs.pop("min_noise_std", 1e-3)
     if distribution_type == "normal":
         action_distribution = distribution.NormalDistribution(event_size=action_size)
     elif distribution_type == "tanh_normal":
-        action_distribution = distribution.NormalTanhDistribution(event_size=action_size)
+        action_distribution = distribution.NormalTanhDistribution(
+            event_size=action_size, min_std=min_noise_std)
     else:
         raise ValueError(f"Unsupported distribution_type={distribution_type}")
 
@@ -681,8 +672,6 @@ def make_ppo_networks(
 
     hidden_dim = kwargs.pop("hidden_dim", 64)
     num_mp_layers = kwargs.pop("num_mp_layers", 1)
-    min_noise_std = kwargs.pop("min_noise_std", 0.03)
-    max_noise_std = kwargs.pop("max_noise_std", 0.25)
     use_residual_gate = kwargs.pop("use_residual_gate", True)
     init_residual_alpha = kwargs.pop("init_residual_alpha", 0.10)
 
@@ -698,14 +687,13 @@ def make_ppo_networks(
         noise_std_type=noise_std_type,
         init_noise_std=init_noise_std,
         min_noise_std=min_noise_std,
-        max_noise_std=max_noise_std,
         use_residual_gate=use_residual_gate,
         init_residual_alpha=init_residual_alpha,
     )
 
     value_module = PrivilegedValueModule(
         hidden_layer_sizes=value_hidden_layer_sizes,
-        activation=nn.tanh,
+        activation=nn.swish,
     )
 
     return PPONetworks(
