@@ -98,13 +98,18 @@ def default_config() -> config_dict.ConfigDict:
         njmax=700,
 
         # --- Reset: orientation -------------------------------------------
-        # Upright starts get small noise; the rest are genuinely tipped over.
-        # (45-85 deg side starts fall back upright on their own ~90% of the time,
-        # so tipped starts begin at 80 deg and go up to fully upside down.)
+        # Upright starts get small noise; the rest are tipped about the wheel axle
+        # (body x, nose-up or tail-up) with random arm angles.
+        # The tipped range is limited to what the hardware can recover from. With the
+        # +/-120 deg arm limit, pushing the arms to the limit from upside down only props
+        # the body at ~118 deg, and open-loop arm/wheel patterns did not right any start
+        # beyond ~110 deg (doubling the arm torque does not help; +/-180 deg arms reach
+        # vertical). Below ~65 deg most starts fall back on their own; 65-110 deg is where
+        # the arms are needed. Raise reset_tipped_roll_max only if the arm range grows.
         reset_upright_probability=0.35,
         reset_upright_tilt_noise=0.05,     # rad, roll and pitch
-        reset_tipped_roll_min=80.0 * np.pi / 180.0,
-        reset_tipped_roll_max=np.pi,
+        reset_tipped_roll_min=40.0 * np.pi / 180.0,
+        reset_tipped_roll_max=110.0 * np.pi / 180.0,
         reset_tipped_pitch_range=0.35,     # rad
         reset_yaw_range=0.10,              # rad around facing -y
         reset_xy_range=0.02,               # m
