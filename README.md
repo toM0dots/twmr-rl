@@ -34,7 +34,7 @@ Stage B, add steps (1-3.5 cm by default), continuing from stage A:
 
 Things to watch (`logs/<run>/training_metrics.jsonl` or TensorBoard): `training/kl_mean` should stay around 0.01-0.03; `eval/episode_task/obstacle_clear_event` is the fraction of eval episodes that got past a step (compare with the obstacle probability); `eval/episode_reward/speed` is driving progress while level. Eval is deterministic by default (`--deterministic_eval`). Raise `obstacle_height_max` with `--playground_config_overrides` once the policy clears the current range.
 
-Notes on the model: every step of 1 cm or more blocks the passive middle wheel, so the arms are always needed to climb. MJX's JAX backend has no cylinder-box collision, so each wheel carries an invisible sphere of the same radius that only touches the obstacle; the cylinders still handle the floor.
+Notes on the model: with the ±120° arm limit the robot cannot right itself from beyond roughly 110° of tilt about the wheel axle (from upside down the arms only prop the body at ~118°, regardless of torque), so tipped resets are limited to 40-110° (`reset_tipped_roll_max`). Every step of 1 cm or more blocks the passive middle wheel, so the arms are always needed to climb. MJX's JAX backend has no cylinder-box collision, so each wheel carries an invisible sphere of the same radius that only touches the obstacle; the cylinders still handle the floor.
 
 ## Development Workflow
 
