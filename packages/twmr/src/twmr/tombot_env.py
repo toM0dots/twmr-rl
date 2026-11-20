@@ -431,7 +431,8 @@ class TransformableWheelMobileRobot(MjxEnv):
             "task/right_arm_angle": data.qpos[self.arm_qpos_adrs[0]],
             "task/left_arm_angle": data.qpos[self.arm_qpos_adrs[1]],
             "task/obstacle_present": info["has_obstacle"],
-            "task/obstacle_cleared": info["cleared"],
+            # One-time event: its episode sum is 1 if the step was cleared.
+            "task/obstacle_clear_event": task["clear_event"],
             "task/failure": failure.astype(jp.float32),
             "diagnostic/wheel_saturation": jp.mean(saturated[:4]),
             "diagnostic/arm_saturation": jp.mean(saturated[4:]),
@@ -499,7 +500,7 @@ class TransformableWheelMobileRobot(MjxEnv):
         names += ["task/up_z", "task/level", "task/heading_alignment", "task/forward_position",
                   "task/forward_velocity", "task/lateral_position", "task/stall_s", "task/blocked",
                   "task/arm_free_gate", "task/right_arm_angle", "task/left_arm_angle",
-                  "task/obstacle_present", "task/obstacle_cleared", "task/failure",
+                  "task/obstacle_present", "task/obstacle_clear_event", "task/failure",
                   "diagnostic/wheel_saturation", "diagnostic/arm_saturation"]
         return names
 

@@ -12,6 +12,30 @@
 
 This script is part of [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground). We should occasionally look for updates to the script. When we update the script we need to add `import twmr` to the top.
 
+### TombotRecovery (recovery, driving, step climbing)
+
+Environment: `packages/twmr/src/twmr/tombot_env.py`. Policy/critic: `sandbox/Tom/tombot_gnn.py`. Model: `packages/twmr/assets/tombot.xml`.
+
+The task is to (1) recover to a flat, upright pose from a random (often tipped-over) start, (2) drive forward steadily while level, and (3) use the arms only when needed, i.e. while tipped over or when blocked by a step. The policy is blind (no forward sensor): it sees IMU, motor currents, wheel/arm encoders, its previous action and a 0.1/0.2/0.4 s history of those. Tuned PPO settings are in `tombot_ppo_config()` in `train_jax_ppo.py`.
+
+Train in two stages. Stage A, recovery and flat driving:
+
+```bash
+./.venv/bin/python train_jax_ppo.py --env_name=TombotRecovery --suffix=stageA \
+  --playground_config_overrides='{"obstacle_probability": 0.0}' --num_timesteps=100000000
+```
+
+Stage B, add steps (1-3.5 cm by default), continuing from stage A:
+
+```bash
+./.venv/bin/python train_jax_ppo.py --env_name=TombotRecovery --suffix=stageB \
+  --load_checkpoint_path=logs/TombotRecovery-<stageA-timestamp>-stageA/checkpoints --num_timesteps=200000000
+```
+
+Things to watch (`logs/<run>/training_metrics.jsonl` or TensorBoard): `training/kl_mean` should stay around 0.01-0.03; `eval/episode_task/obstacle_clear_event` is the fraction of eval episodes that got past a step (compare with the obstacle probability); `eval/episode_reward/speed` is driving progress while level. Eval is deterministic by default (`--deterministic_eval`). Raise `obstacle_height_max` with `--playground_config_overrides` once the policy clears the current range.
+
+Notes on the model: every step of 1 cm or more blocks the passive middle wheel, so the arms are always needed to climb. MJX's JAX backend has no cylinder-box collision, so each wheel carries an invisible sphere of the same radius that only touches the obstacle; the cylinders still handle the floor.
+
 ## Development Workflow
 
 ### Prerequisites
