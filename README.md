@@ -32,7 +32,13 @@ Stage B, add steps (1-3.5 cm by default), continuing from stage A:
   --load_checkpoint_path=logs/TombotRecovery-<stageA-timestamp>-stageA/checkpoints --num_timesteps=200000000
 ```
 
-Things to watch (`logs/<run>/training_metrics.jsonl` or TensorBoard): `training/kl_mean` should stay around 0.01-0.03; `eval/episode_task/obstacle_clear_event` is the fraction of eval episodes that got past a step (compare with the obstacle probability); `eval/episode_reward/speed` is driving progress while level. Eval is deterministic by default (`--deterministic_eval`). Raise `obstacle_height_max` with `--playground_config_overrides` once the policy clears the current range.
+Things to watch (`logs/<run>/training_metrics.jsonl` or TensorBoard): `training/kl_mean` should stay around 0.01-0.03; `eval/episode_task/obstacle_clear_event` is the fraction of eval episodes that got past a step (compare with the obstacle probability); `eval/episode_reward/speed` is driving progress while level. Eval is deterministic by default (`--deterministic_eval`). Raise `obstacle_height_max` with `--playground_config_overrides` once the policy clears the current range (the obstacle box supports steps up to 10 cm).
+
+Benchmark a checkpoint on fixed recovery starts (per tilt band) and step heights:
+
+```bash
+./.venv/bin/python eval_tombot.py logs/<run>/checkpoints --tilt_bands 40:60,60:85,85:110 --step_heights_cm 1,2,3,4,5,6
+```
 
 Notes on the model: with the ±120° arm limit the robot cannot right itself from beyond roughly 110° of tilt about the wheel axle (from upside down the arms only prop the body at ~118°, regardless of torque), so tipped resets are limited to 40-110° (`reset_tipped_roll_max`). Every step of 1 cm or more blocks the passive middle wheel, so the arms are always needed to climb. MJX's JAX backend has no cylinder-box collision, so each wheel carries an invisible sphere of the same radius that only touches the obstacle; the cylinders still handle the floor.
 

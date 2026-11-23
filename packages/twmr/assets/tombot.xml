@@ -50,11 +50,11 @@
 
     <!-- Step obstacle. Robot front points toward negative y.
          Mocap body: the env sets its position every episode. The visible step height is
-         controlled by sinking the 5 cm box into the floor (box top = mocap z + 0.025),
+         controlled by sinking the 10 cm box into the floor (box top = mocap z + 0.05),
          and episodes without an obstacle sink it completely.
-         size = half-dimensions: 0.6 m wide, 0.05 m deep, up to 0.05 m high. -->
-    <body name="step_obstacle" mocap="true" pos="0 -0.35 -0.03">
-      <geom name="step_obstacle_geom" type="box" size="0.3 0.025 0.025" contype="4" conaffinity="8" material="obstacle_mat" friction="0.8 0.01 0.001"/>
+         size = half-dimensions: 0.6 m wide, 0.05 m deep, up to 0.10 m high. -->
+    <body name="step_obstacle" mocap="true" pos="0 -0.35 -0.11">
+      <geom name="step_obstacle_geom" type="box" size="0.3 0.025 0.05" contype="4" conaffinity="8" material="obstacle_mat" friction="0.8 0.01 0.001"/>
     </body>
 
     <!-- Body height set so the lower face of main_frame_box is 19.8 mm above the ground.

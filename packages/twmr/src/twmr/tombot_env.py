@@ -82,7 +82,7 @@ ACTUATOR_NAMES = (
 )
 
 OBSTACLE_HALF_DEPTH = 0.025   # must match the step_obstacle geom size in the XML
-OBSTACLE_HALF_HEIGHT = 0.025
+OBSTACLE_HALF_HEIGHT = 0.05   # 10 cm box sunk into the floor: steps up to 10 cm
 FRONT_REACH = 0.14            # hub origin to front of the front wheels, m
 
 
