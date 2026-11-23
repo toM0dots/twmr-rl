@@ -123,9 +123,16 @@ def default_config() -> config_dict.ConfigDict:
         # --- Obstacle --------------------------------------------------------
         obstacle_probability=0.6,
         obstacle_height_min=0.010,         # m (1 cm already blocks the middle wheel)
-        obstacle_height_max=0.035,
+        # Open-loop trajectory optimisation clears 4 cm steps but no 5-8 cm step (it
+        # stalls ~70% of the way, with the arm-less rear end against the face), so the
+        # default range stops at 4.5 cm. Train 1-3 cm first, then widen.
+        obstacle_height_max=0.045,
         obstacle_distance_min=0.15,        # m from the front wheels to the step face
         obstacle_distance_max=0.45,
+        # Fraction of upright obstacle episodes that start right at the step
+        # (0.5-3 cm from the face), so the climb itself gets practised directly.
+        obstacle_near_start_probability=0.3,
+        obstacle_near_distance_max=0.03,
     )
 
 
@@ -173,11 +180,19 @@ class TransformableWheelMobileRobot(MjxEnv):
     reward_level = 0.2       # level
     reward_recovery = 3.0    # potential shaping on up_z: up_z(t+1) - up_z(t)
     reward_clear_obstacle = 5.0  # one-time, when the whole robot is past the step
+    # Climbing progress: paid once per unit of new progress through the step zone
+    # (from just before the front wheels touch the face to the clear line), whenever
+    # the robot is not tipped over. It is NOT level-gated, so the pitched climb phase
+    # is rewarded, and it tracks the best progress so far, so it cannot be farmed.
+    # The episode total is at most reward_climb_progress.
+    reward_climb_progress = 6.0
+    climb_zone_lead = 0.02       # m: the zone starts this far before front-wheel contact
+    climb_min_up_z = 0.5         # progress only counts while up_z is above this
 
-    # Arm usage. "free" = level * (1 - blocked): penalties apply while the robot
-    # is level and driving freely, and are lifted while it is tipped over or
-    # blocked. Tilting does NOT switch them off for free, because tilting also
-    # removes the speed and level rewards.
+    # Arm usage. "free" = level * (1 - blocked) * (1 - in_step_zone): penalties apply
+    # while the robot is level and driving freely, and are lifted while it is tipped
+    # over, blocked, or in the step zone (until the step is cleared). Tilting does NOT
+    # switch them off for free, because tilting also removes the speed and level rewards.
     penalty_arm_pose = 0.3        # free * mean((arm_angle / 30 deg)^2), ratio capped at 2
     penalty_arm_speed = 0.02      # free * mean((arm_speed / 10 rpm)^2), ratio capped at 2
     arm_angle_scale_deg = 30.0
@@ -341,11 +356,13 @@ class TransformableWheelMobileRobot(MjxEnv):
 
         start_xy = u(keys[9], -cfg.reset_xy_range, cfg.reset_xy_range, (2,))
 
-        # Obstacle: a 5 cm box sunk into the floor so that its top is at `height`;
+        # Obstacle: a 10 cm box sunk into the floor so that its top is at `height`;
         # sunk completely when this episode has no obstacle.
         has_obstacle = jax.random.uniform(keys[10]) < cfg.obstacle_probability
         height = u(keys[11], cfg.obstacle_height_min, cfg.obstacle_height_max)
         distance = u(keys[12], cfg.obstacle_distance_min, cfg.obstacle_distance_max)
+        near = (~tipped) & (jax.random.uniform(keys[13]) < cfg.obstacle_near_start_probability)
+        distance = jp.where(near, u(keys[14], 0.005, cfg.obstacle_near_distance_max), distance)
         face_y = start_xy[1] - FRONT_REACH - distance
         obstacle_pos = jp.array([
             0.0,
@@ -382,6 +399,7 @@ class TransformableWheelMobileRobot(MjxEnv):
             "frame_hist": jp.tile(frame[None], (HIST_LEN, 1)),
             "stall_s": jp.zeros(()),
             "cleared": jp.zeros(()),
+            "best_progress": jp.zeros(()),
             "has_obstacle": has_obstacle.astype(jp.float32),
             "obstacle_height": jp.where(has_obstacle, height, 0.0),
             "obstacle_face_y": face_y,
@@ -411,6 +429,7 @@ class TransformableWheelMobileRobot(MjxEnv):
 
         info["stall_s"] = task["stall_s"]
         info["cleared"] = jp.maximum(info["cleared"], task["clear_event"])
+        info["best_progress"] = task["best_progress"]
         info["last_action"] = action
 
         frame = self._proprio_frame(data)
@@ -438,6 +457,8 @@ class TransformableWheelMobileRobot(MjxEnv):
             "task/obstacle_present": info["has_obstacle"],
             # One-time event: its episode sum is 1 if the step was cleared.
             "task/obstacle_clear_event": task["clear_event"],
+            "task/in_step_zone": task["in_zone"],
+            "task/climb_progress": task["best_progress"],
             "task/failure": failure.astype(jp.float32),
             "diagnostic/wheel_saturation": jp.mean(saturated[:4]),
             "diagnostic/arm_saturation": jp.mean(saturated[4:]),
@@ -465,7 +486,21 @@ class TransformableWheelMobileRobot(MjxEnv):
         stalled = trying & (v_forward < self.stall_speed_fraction * self.target_speed) & (level > 0.5)
         stall_s = jp.where(stalled, info["stall_s"] + self.dt, jp.maximum(info["stall_s"] - 2.0 * self.dt, 0.0))
         blocked = jp.clip(stall_s / self.blocked_ramp_s, 0.0, 1.0)
-        free = level * (1.0 - blocked)
+
+        # Step zone and climbing progress (privileged; reward only).
+        has_obstacle = info["has_obstacle"] > 0.5
+        far_face_y = info["obstacle_face_y"] - 2.0 * OBSTACLE_HALF_DEPTH
+        clear_y = far_face_y - 0.17
+        zone_start_y = info["obstacle_face_y"] + FRONT_REACH + self.climb_zone_lead
+        progress = jp.clip((zone_start_y - data.qpos[1]) / (zone_start_y - clear_y), 0.0, 1.0)
+        upright_enough = up > self.climb_min_up_z
+        best_progress = jp.where(has_obstacle & upright_enough,
+                                 jp.maximum(info["best_progress"], progress), info["best_progress"])
+        progress_gain = best_progress - info["best_progress"]
+        in_zone = (has_obstacle & (progress > 0.0) & (info["cleared"] < 0.5)).astype(jp.float32)
+
+        # Arm penalties are off while tipped (level), blocked, or in the step zone.
+        free = level * (1.0 - blocked) * (1.0 - in_zone)
 
         arm_q = data.qpos[self.arm_qpos_adrs]
         arm_qd = data.qvel[self.arm_qvel_adrs]
@@ -473,15 +508,15 @@ class TransformableWheelMobileRobot(MjxEnv):
         speed_ratio = jp.clip(arm_qd / self.arm_speed_scale, -self.arm_ratio_cap, self.arm_ratio_cap)
 
         # One-time bonus once the rear wheels are past the step's far face.
-        far_face_y = info["obstacle_face_y"] - 2.0 * OBSTACLE_HALF_DEPTH
-        past = data.qpos[1] < far_face_y - 0.17
-        clear_event = (past & (info["has_obstacle"] > 0.5) & (up > 0.7)).astype(jp.float32) * (1.0 - info["cleared"])
+        past = data.qpos[1] < clear_y
+        clear_event = (past & has_obstacle & (up > 0.7)).astype(jp.float32) * (1.0 - info["cleared"])
 
         terms = {
             "speed": self.reward_speed * level * align * jp.clip(v_forward / self.target_speed, -1.0, 1.0),
             "level": self.reward_level * level,
             "recovery": self.reward_recovery * (up - up_prev),
             "clear_obstacle": self.reward_clear_obstacle * clear_event,
+            "climb_progress": self.reward_climb_progress * progress_gain,
             "penalty_arm_pose": -self.penalty_arm_pose * free * jp.mean(angle_ratio ** 2),
             "penalty_arm_speed": -self.penalty_arm_speed * free * jp.mean(speed_ratio ** 2),
             "penalty_action": -self.penalty_action * jp.mean(action ** 2),
@@ -494,18 +529,20 @@ class TransformableWheelMobileRobot(MjxEnv):
             "up_z": up, "level": level, "align": align, "v_forward": v_forward,
             "forward_position": -(data.qpos[1] - info["start_xy"][1]),
             "stall_s": stall_s, "blocked": blocked, "free": free, "clear_event": clear_event,
+            "in_zone": in_zone, "best_progress": best_progress,
         }
         return terms, task
 
     @staticmethod
     def _metric_names() -> list[str]:
-        names = ["reward/speed", "reward/level", "reward/recovery", "reward/clear_obstacle",
+        names = ["reward/speed", "reward/level", "reward/recovery", "reward/clear_obstacle", "reward/climb_progress",
                  "penalty/arm_pose", "penalty/arm_speed", "penalty/action", "penalty/action_rate",
                  "penalty/lateral_vel", "penalty/body_rate", "penalty/heading", "reward", "reward/total"]
         names += ["task/up_z", "task/level", "task/heading_alignment", "task/forward_position",
                   "task/forward_velocity", "task/lateral_position", "task/stall_s", "task/blocked",
                   "task/arm_free_gate", "task/right_arm_angle", "task/left_arm_angle",
-                  "task/obstacle_present", "task/obstacle_clear_event", "task/failure",
+                  "task/obstacle_present", "task/obstacle_clear_event", "task/in_step_zone",
+                  "task/climb_progress", "task/failure",
                   "diagnostic/wheel_saturation", "diagnostic/arm_saturation"]
         return names
 

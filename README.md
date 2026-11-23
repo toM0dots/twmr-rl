@@ -25,14 +25,19 @@ Train in two stages. Stage A, recovery and flat driving:
   --playground_config_overrides='{"obstacle_probability": 0.0}' --num_timesteps=100000000
 ```
 
-Stage B, add steps (1-3.5 cm by default), continuing from stage A:
+Stage B, add steps, continuing from stage A. Start with 1-3 cm (`obstacle_height_max=0.03`), then continue to the default 1-4.5 cm. Trajectory optimisation on this model clears 4 cm steps but no 5-8 cm step, so do not raise the range much past 4.5 cm without hardware changes:
 
 ```bash
 ./.venv/bin/python train_jax_ppo.py --env_name=TombotRecovery --suffix=stageB \
-  --load_checkpoint_path=logs/TombotRecovery-<stageA-timestamp>-stageA/checkpoints --num_timesteps=200000000
+  --load_checkpoint_path=logs/TombotRecovery-<stageA-timestamp>-stageA/checkpoints --num_timesteps=100000000 \
+  --playground_config_overrides='{"obstacle_height_max": 0.03}'
+./.venv/bin/python train_jax_ppo.py --env_name=TombotRecovery --suffix=stageB2 \
+  --load_checkpoint_path=logs/TombotRecovery-<stageB-timestamp>-stageB/checkpoints --num_timesteps=100000000
 ```
 
-Things to watch (`logs/<run>/training_metrics.jsonl` or TensorBoard): `training/kl_mean` should stay around 0.01-0.03; `eval/episode_task/obstacle_clear_event` is the fraction of eval episodes that got past a step (compare with the obstacle probability); `eval/episode_reward/speed` is driving progress while level. Eval is deterministic by default (`--deterministic_eval`). Raise `obstacle_height_max` with `--playground_config_overrides` once the policy clears the current range (the obstacle box supports steps up to 10 cm).
+Climbing is rewarded by progress through the step zone (paid once per unit of new progress while not tipped over, so the pitched climb phase counts and it cannot be farmed), plus a one-time bonus when the whole robot is past the step. 30% of upright obstacle episodes start right at the step face.
+
+Things to watch (`logs/<run>/training_metrics.jsonl` or TensorBoard): `training/kl_mean` should stay around 0.01-0.03; `eval/episode_task/obstacle_clear_event` is the fraction of eval episodes that got past a step (compare with the obstacle probability); `eval/episode_reward/speed` is driving progress while level. Eval is deterministic by default (`--deterministic_eval`). The obstacle box supports steps up to 10 cm if the hardware changes.
 
 Benchmark a checkpoint on fixed recovery starts (per tilt band) and step heights:
 
