@@ -92,14 +92,16 @@ _PLAYGROUND_CONFIG_OVERRIDES = flags.DEFINE_string(
 )
 _VISION = flags.DEFINE_boolean("vision", False, "Use vision input")
 _LOAD_CHECKPOINT_PATH = flags.DEFINE_string(
-    "load_checkpoint_path", '/users/0/tang1014/tmwr/twmr-rl/logs/TombotRecovery-20260717-081350/checkpoints', "Path to load checkpoint from"
+    "load_checkpoint_path", None, "Path to load checkpoint from"
 )
+_RESTORE_VALUE_FN = flags.DEFINE_boolean( "restore_value_fn", True, "Restore the checkpoint critic. False reinitializes the critic.",)
 
+# recovery '/users/0/tang1014/tmwr/twmr-rl/logs/TombotRecovery-20260724-152116/checkpoints/000003225600'
 # gnn '/users/0/tang1014/tmwr/twmr-rl/logs/TransformableWheelMobileRobot-20260407-031936/checkpoints'
 # '/users/0/tang1014/tmwr/twmr-rl/logs/T-20260407-031936/checkpoints'
 _SUFFIX = flags.DEFINE_string("suffix", None, "Suffix for the experiment name")
 _PLAY_ONLY = flags.DEFINE_boolean(
-    "play_only", False, "If true, only play with the model and do not train"
+    "play_only", True, "If true, only play with the model and do not train"
 )
 _USE_WANDB = flags.DEFINE_boolean(
     "use_wandb",
@@ -277,6 +279,20 @@ def main(argv):
     if _PLAYGROUND_CONFIG_OVERRIDES.value is not None:
         env_cfg_overrides = json.loads(_PLAYGROUND_CONFIG_OVERRIDES.value)
     env = registry.load(_ENV_NAME.value, config=env_cfg, config_overrides=env_cfg_overrides)
+    import inspect
+
+    print("Environment source:", inspect.getfile(type(env)))
+
+    for name in (
+        "arm_quiet_posture_weight",
+        "arm_quiet_angle_scale_deg",
+        "arm_quiet_angle_ratio_cap",
+        "reward_reach_step",
+        "reward_cross_step",
+        "reward_stabilize_after_crossing",
+        "penalty_post_cross_tilt",
+    ):
+        print(f"{name}: {getattr(env, name, 'MISSING')}")
     
     print("REQUESTED ENV:", _ENV_NAME.value)
     print("ENV CLASS:", type(env))
@@ -325,20 +341,64 @@ def main(argv):
 
     # Handle checkpoint loading
     if _LOAD_CHECKPOINT_PATH.value is not None:
-        # Convert to absolute path
-        ckpt_path = epath.Path(_LOAD_CHECKPOINT_PATH.value).resolve()
-        if ckpt_path.is_dir():
-            latest_ckpts = list(ckpt_path.glob("*"))
-            latest_ckpts = [ckpt for ckpt in latest_ckpts if ckpt.is_dir()]
-            latest_ckpts.sort(key=lambda x: int(x.name))
-            latest_ckpt = latest_ckpts[-1]
-            restore_checkpoint_path = latest_ckpt
-            print(f"Restoring from: {restore_checkpoint_path}")
-        else:
+        ckpt_path = epath.Path(
+            _LOAD_CHECKPOINT_PATH.value
+        ).resolve()
+
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint path does not exist: {ckpt_path}"
+            )
+
+        if not ckpt_path.is_dir():
+            raise ValueError(
+                f"Checkpoint path is not a directory: {ckpt_path}"
+            )
+
+        # Case 1:
+        # The supplied path is already a numeric checkpoint directory,
+        # for example checkpoints/000003225600.
+        if ckpt_path.name.isdigit():
             restore_checkpoint_path = ckpt_path
-            print(f"Restoring from checkpoint: {restore_checkpoint_path}")
+
+            print(
+                f"Restoring directly from checkpoint: "
+                f"{restore_checkpoint_path}"
+            )
+
+        # Case 2:
+        # The supplied path is the parent checkpoints directory.
+        else:
+            numeric_checkpoints = sorted(
+                (
+                    path
+                    for path in ckpt_path.iterdir()
+                    if path.is_dir()
+                    and path.name.isdigit()
+                ),
+                key=lambda path: int(path.name),
+            )
+
+            if not numeric_checkpoints:
+                raise FileNotFoundError(
+                    "No numeric checkpoint directories found in "
+                    f"{ckpt_path}"
+                )
+
+            restore_checkpoint_path = (
+                numeric_checkpoints[-1]
+            )
+
+            print(
+                f"Restoring latest checkpoint: "
+                f"{restore_checkpoint_path}"
+            )
+
     else:
-        print("No checkpoint path provided, not restoring from checkpoint")
+        print(
+            "No checkpoint path provided, "
+            "not restoring from checkpoint"
+        )
         restore_checkpoint_path = None
 
     # Set up checkpoint directory
@@ -437,7 +497,12 @@ def main(argv):
         **training_params,
         network_factory=network_factory,
         seed=_SEED.value,
+
+        # Restore observation normalization and actor,
+        # but randomly initialize a new critic.
         restore_checkpoint_path=restore_checkpoint_path,
+        restore_value_fn=False,
+
         save_checkpoint_path=ckpt_path,
         wrap_env_fn=None if _VISION.value else wrapper.wrap_for_brax_training,
         num_eval_envs=num_eval_envs,
@@ -448,7 +513,7 @@ def main(argv):
 
     def progress(num_steps, metrics):
         global metrics_csv_header_written
-
+        
         times.append(time.monotonic())
 
         row = {"num_steps": int(num_steps)}
@@ -469,6 +534,7 @@ def main(argv):
                     writer_csv.writeheader()
                     metrics_csv_header_written = True
                 writer_csv.writerow(row)
+        
 
         # Log to Weights & Biases
         if _USE_WANDB.value and not _PLAY_ONLY.value:
@@ -485,6 +551,20 @@ def main(argv):
 
         if _LOG_TRAINING_METRICS.value and "episode/sum_reward" in row:
             print(f"{num_steps}: mean episode reward={row['episode/sum_reward']:.3f}")
+    
+        debug_items = {
+        key: value
+        for key, value in metrics.items()
+        if (
+            key.startswith("training/debug_")
+            or "diagnostic/" in key
+            )
+        }
+
+        if debug_items:
+            print(f"\nDiagnostics at step {num_steps}:")
+            for key in sorted(debug_items):
+                print(f"  {key}: {float(debug_items[key]):.6g}")
             
     # Load evaluation environment.
     eval_env = None

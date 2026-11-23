@@ -705,7 +705,7 @@ def make_ppo_networks(
 
     value_module = PrivilegedValueModule(
         hidden_layer_sizes=value_hidden_layer_sizes,
-        activation=activation,
+        activation=nn.tanh,
     )
 
     return PPONetworks(

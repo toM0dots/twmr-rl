@@ -34,7 +34,9 @@
 
     <!-- Higher step obstacle for traversal. Robot front points toward negative y in this draft.
          size = half-dimensions: 0.45m wide, 0.05m deep, 0.035m high. -->
-<!--     <geom name="step_obstacle" type="box" pos="0 -0.30 0.0175" size="0.225 0.025 0.0175" material="obstacle_mat" friction="0.8 0.01 0.001"/> -->
+<!--     <geom name="step_obstacle" type="box" pos="0 -0.30 0.0175" size="0.225 0.025 0.0075" contype="1" conaffinity="1" material="obstacle_mat" friction="0.4 0.01 0.001"/>  -->
+      
+
 
     <!-- Body height set so the lower face of main_frame_box is 19.8 mm above the ground.
          main_frame bottom = robot_z + 0.0182 - 0.0198 = 0.0198 m, so robot_z = 0.0214 m. -->
